@@ -1,0 +1,222 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Business Context
+An online retailer wants to better understand its customers and optimize sales performance. The dataset contains more than 1 million transactions over a two-year period.
+
+**Business Goals:**
+
+- Increase profitability by identifying and retaining high-value customers
+- Optimize inventory and pricing decisions using demand forecasting
+- Detect fraudulent or unusual transactions
+- Design marketing campaigns to improve customer engagement
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(scales)
+library(cluster)
+library(factoextra)
+library(forecast)
+library(MASS)
+library(e1071)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(knitr)
+```
+
+# Dataset Overview
+
+```{r load-data}
+# Read sheets
+retail_2009_2010 <- read_excel("online_retail.1.xlsx", sheet = "Year 2009-2010")
+retail_2010_2011 <- read_excel("online_retail.1.xlsx", sheet = "Year 2010-2011")
+
+# Combine
+retail_raw <- bind_rows(retail_2009_2010, retail_2010_2011)
+
+# Quick check
+glimpse(retail_raw)
+
+```
+
+**Features:**
+
+- InvoiceNo: Unique ID for each transaction
+- StockCode: Product code
+- Description: Product description
+- Quantity: Number of items bought
+- InvoiceDate: Date of transaction
+- UnitPrice: Price per item
+- CustomerID: Unique customer identifier
+- Country: Customer location
+
+
+## Customer Analytics
+
+### Which customers generate the most revenue (RFM analysis)?
+
+```{r rfm-analysis}
+retail_clean <- retail_raw %>%
+  rename(InvoiceNo = Invoice, CustomerID = `Customer ID`, UnitPrice = Price) %>%
+  filter(!is.na(CustomerID), !is.na(Description), !str_detect(InvoiceNo, "^C"),
+         Quantity > 0, UnitPrice > 0) %>%
+  mutate(Revenue = Quantity * UnitPrice, InvoiceDate = as.POSIXct(InvoiceDate))
+
+reference_date <- max(retail_clean$InvoiceDate) + days(1)
+
+rfm_data <- retail_clean %>%
+  group_by(CustomerID) %>%
+  summarise(
+    Recency = as.numeric(reference_date - max(InvoiceDate), units = "days"),
+    Frequency = n_distinct(InvoiceNo),
+    Monetary = sum(Revenue)
+  ) %>%
+  mutate(
+    R_Score = ntile(desc(Recency), 5),
+    F_Score = ntile(Frequency, 5),
+    M_Score = ntile(Monetary, 5),
+    RFM_Score = R_Score + F_Score + M_Score
+  )
+
+rfm_data %>% arrange(desc(Monetary)) %>% head(20) %>% kable()
+
+```
+
+### Can we segment customers into groups (e.g., high-value, casual, wholesale)?
+
+```{r customer-segmentation}
+rfm_segments <- rfm_data %>%
+  mutate(
+    Segment = case_when(
+      R_Score >= 4 & F_Score >= 4 & M_Score >= 4 ~ "high-value,",
+      R_Score >= 3 & F_Score >= 3 & M_Score >= 3 ~ "Loyal Customers",
+      R_Score <= 2 & F_Score >= 4 ~ "casual,",
+      R_Score <= 2 & F_Score <= 2 ~ "pppffff",
+      TRUE ~ "Regular"
+    )
+  )
+
+rfm_segments %>% group_by(Segment) %>%
+  summarise(Count = n(), Total_Revenue = sum(Monetary), Avg_Revenue = mean(Monetary)) %>%
+  arrange(desc(Total_Revenue)) %>% kable()
+
+ggplot(rfm_segments %>% group_by(Segment) %>% summarise(Count = n()),
+       aes(x = reorder(Segment, Count), y = Count, fill = Segment)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  labs(title = "Customer Segments", x = "Segment", y = "Count") + theme_minimal()
+
+set.seed(123)
+rfm_scaled <- scale(dplyr::select(rfm_data, Recency, Frequency, Monetary))
+kmeans_result <- kmeans(rfm_scaled, centers = 4, nstart = 25)
+```
+
+### Which countries contribute the most to sales growth?
+
+```{r country-growth}
+country_yearly <- retail_clean %>%
+  mutate(Year = year(InvoiceDate)) %>%
+  group_by(Country, Year) %>%
+  summarise(Revenue = sum(Revenue)) %>%
+  arrange(Country, Year) %>%
+  group_by(Country) %>%
+  mutate(Growth = (Revenue - lag(Revenue)) / lag(Revenue) * 100) %>%
+  filter(!is.na(Growth))
+
+country_yearly %>% group_by(Country) %>%
+  summarise(Avg_Growth = mean(Growth), Total_Revenue = sum(Revenue)) %>%
+  filter(Total_Revenue > 10000) %>%
+  arrange(desc(Avg_Growth)) %>% head(10) %>% kable()
+
+retail_clean %>% group_by(Country) %>%
+  summarise(Revenue = sum(Revenue)) %>%
+  arrange(desc(Revenue)) %>% head(10) %>%
+  ggplot(aes(x = reorder(Country, Revenue), y = Revenue)) +
+  geom_bar(stat = "identity", fill = "darkgreen") + coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Top Countries by Revenue") + theme_minimal()
+```
+
+## Product & Sales Analysis
+
+### What are the top-selling products?
+
+```{r top-products}
+product_stats <- retail_clean %>%
+  group_by(StockCode, Description) %>%
+  summarise(Total_Quantity = sum(Quantity), Total_Revenue = sum(Revenue)) %>%
+  arrange(desc(Total_Revenue))
+
+product_stats %>% head(20) %>% kable()
+
+product_stats %>% head(10) %>%
+  ggplot(aes(x = reorder(Description, Total_Revenue), y = Total_Revenue)) +
+  geom_bar(stat = "identity", fill = "steelblue") + coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Top 10 Products by Revenue", x = "Product") + theme_minimal()
+```
+
+```{r eda-summary}
+# Analytical Approaches
+
+## Exploratory Data Analysis (EDA)
+
+retail_clean %>%
+  summarise(
+    Total_Revenue = sum(Revenue),
+    Total_Transactions = n_distinct(InvoiceNo),
+    Total_Customers = n_distinct(CustomerID),
+    Avg_Transaction = mean(Revenue)
+  ) %>% kable()
+
+#Monthly revenue Trend
+
+retail_clean %>% mutate(YearMonth = floor_date(InvoiceDate, "month")) %>%
+  group_by(YearMonth) %>%
+  summarise(Revenue = sum(Revenue)) %>%
+  ggplot(aes(x = YearMonth, y = Revenue)) +
+  geom_line(size = 1.2, color = "steelblue") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Monthly Revenue Trend") + theme_minimal()
+```
+
+## Customer Segmentation
+
+```{r segmentation-summary}
+cat("K-Means Clustering Results:\n")
+rfm_clustered <- rfm_data %>%
+  mutate(Cluster = kmeans_result$cluster)
+
+rfm_clustered %>% group_by(Cluster) %>%
+  summarise(
+    Count = n(),
+    Avg_Recency = mean(Recency),
+    Avg_Frequency = mean(Frequency),
+    Avg_Monetary = mean(Monetary)
+  ) %>% kable()
+```
+
+## Churn Prediction
+
+```{r churn-summary}
+cat("Logistic Regression Model Performance:\n")
+cat("Accuracy:", round(confusionMatrix(factor(pred_class), factor(test_data$Churned))$overall['Accuracy'], 3), "\n")
+```
+
+## Demand Forecasting
+
+```{r forecast-summary}
+cat("ARIMA Model Summary:\n")
+print(arima_model)
+```
+
+## Anomaly Detection
+
+```{r anomaly-summary}
+cat("Anomalies detected:", nrow(anomalies), "\n")
+cat("High-value transactions (top 1%):", nrow(high_value), "\n")
+```
