@@ -1,0 +1,222 @@
+---
+title: "EDA"
+author: "Olivia Shipley"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Preparation 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(readxl)
+library(stats)
+library(lubridate)
+library(ggplot2)
+```
+
+```{r - attach to git}
+#gitclone https://github.com/[ollypop]/da6813-casestudy2.git
+#cd da6813-casestudy2
+```
+
+```{r - importing with all sheets}
+original <- lapply(excel_sheets("/Users/oliviashipley/Desktop/DA 6813/da6813-casestudy2/online_retail.xlsx"), 
+              function(x) read_excel("/Users/oliviashipley/Desktop/DA 6813/da6813-casestudy2/online_retail.xlsx", sheet = x))
+
+names(original) <- excel_sheets("online_retail.xlsx")
+
+list2env(original, envir = .GlobalEnv)
+
+View(original)
+```
+
+```{r - combine years into a single df}
+combined <- bind_rows(original)
+
+#summary stats
+summary(combined)
+str(combined)
+```
+
+```{r}
+# Check for missing values
+colSums(is.na(combined))
+
+# Check how many are missing
+sum(is.na(combined$"Customer ID"))
+sum(is.na(combined$"Customer ID")) / nrow(combined) * 100  # Percentage
+```
+
+# Cleaning
+
+```{r}
+combined <- combined |>
+  rename(CustomerID = `Customer ID`)
+```
+
+```{r - seperate date and time column}
+combined <- combined |>
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate),
+    Day = day(InvoiceDate),
+    Hour = hour(InvoiceDate)
+  )
+```
+
+## Separate datasets for different analyses
+
+```{r - full dataset for product and sales}
+retail_all <- combined
+```
+
+```{r - customer analysis}
+retail_customer <- combined |>
+  filter(!is.na(CustomerID))
+```
+
+```{r - product analysis}
+retail_product <- combined
+```
+
+## Add flag column for returns
+
+```{r}
+retail_all <- retail_all |>
+  mutate(
+    is_return = Quantity < 0,
+    TotalPrice = Quantity * Price
+  )
+
+retail_customer <- retail_customer |>
+  mutate(
+    is_return = Quantity < 0,
+    TotalPrice = Quantity * Price
+  )
+
+retail_product <- retail_product |>
+  mutate(
+    is_return = Quantity < 0,
+    TotalPrice = Quantity * Price
+  )
+```
+
+# Exploratory Data Analysis
+
+```{r - Sales trends over time}
+sales_by_period <- retail_all |>
+  group_by(Year, Month) |>
+  summarise(
+    total_sales = sum(TotalPrice) # What do you want to calculate?
+  )
+```
+
+```{r - had to create a new date column}
+sales_by_period <- sales_by_period |>
+  mutate(Date = make_date(Year, Month, 1))
+
+#plot
+ggplot(data = sales_by_period, aes(x = Date, y = total_sales)) +
+  geom_line() +
+  labs(
+    title = "Sales Trend Over Time",
+    x = "Month",
+    y = "Total Sales"
+  ) +
+  theme_minimal()
+```
+
+```{r - Top products by revenue}
+
+```
+
+```{r - Seasonal patterns}
+
+```
+
+```{r - Country analysis}
+
+```
+
+## Customer Analytics
+
+-   Which customers generate the most revenue (RFM analysis)?
+-   Can we segment customers into groups (e.g., high-value, casual, wholesale)?
+-   Which countries contribute the most to sales growth?
+
+```{r - RFM ANALYSIS}
+
+```
+
+## Product Analysis
+
+-   Best/worst performing products
+-   Product demand patterns
+
+### Returns Impact: Revenue, Product, Country
+
+```{r - check for negatives}
+table(retail_all$is_return)
+
+# % return transactions
+cat("\nPercentage of return transactions:", 
+    round(mean(retail_all$is_return) * 100, 2), "%\n\n")
+```
+
+### *Percentage of return transactions: 2.15 %*
+
+```{r - Revenue Impact}
+revenue_impact <- retail_all |>
+  group_by(is_return) |>
+  summarise(
+    transactions = n(),
+    total_revenue = sum(TotalPrice, na.rm = TRUE),
+    pct_transactions = round(n() / nrow(retail_all) * 100, 2)
+  ) |>
+  mutate(pct_revenue = round(total_revenue / sum(total_revenue) * 100, 2))
+
+print(revenue_impact)
+```
+
+### *Returns accounts for about 7.92% of revenue*
+
+```{r - product highest return rate}
+product_returns <- retail_all |>
+  group_by(StockCode, Description) |>
+  summarise(
+    total_transactions = n(),
+    returns = sum(is_return),
+    return_rate = round(returns / total_transactions * 100, 2),
+    .groups = "drop"
+  ) |>
+  filter(total_transactions >= 10) |>  # Only products with 10+ transactions
+  arrange(desc(return_rate)) |>
+  head(10)
+
+print(product_returns)
+```
+
+### *The product, 'CRUK Commission' has a 100% return rate*
+
+```{r - return rates by country}
+country_returns <- retail_all |>
+  group_by(Country) |>
+  summarise(
+    transactions = n(),
+    returns = sum(is_return),
+    return_rate = round(returns / transactions * 100, 2),
+    .groups = "drop"
+  ) |>
+  filter(transactions >= 100) |>  # Only countries with 100+ transactions
+  arrange(desc(return_rate)) |>
+  head(10)
+
+print(country_returns)
+```
+
+## *The US has the highest return rate by country (23.55%)*
