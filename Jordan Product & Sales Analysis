@@ -1,0 +1,887 @@
+
+title: "EDA Final"
+format: html
+editor: source
+---
+
+```{r}
+library(MASS)
+library(caret)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(car)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(cluster)
+library(gridExtra)
+library(forecast)
+```
+
+# EDA
+
+```{r}
+df <- bind_rows(
+  read_excel("online_retail.xlsx", sheet = "Year 2009-2010"),
+  read_excel("online_retail.xlsx", sheet = "Year 2010-2011"))
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+str(df)
+```
+Categorical Variables:
+Invoice
+StockCode
+Description
+Country
+InvoiceDate
+
+Numerical Variables:
+Quantity
+Price
+Customer ID
+
+
+```{r}
+# check for NA's
+# Description NA's... those products still matter but what are they
+colSums(is.na(df))
+```
+Customer ID is missing a ton of values, does that mean those aren't sales? the quantity still changes so there were sales that existed but for some reason there aren't Customer ID's, not sure what that indicates
+
+# Data Cleaning
+
+## Important: Stock code M will need to be removed when modeling stock
+M is manual override. For some reason, the product information was lost but the sales, quantity, and customer info was retained for that sale. Keeping M in for the meantime to accurately track sales and customer spending. Weird however that on an online store isn't accurately tracking the stock being bought.
+
+df <- df |> 
+  filter(!StockCode %in% c("M"))
+
+
+```{r}
+# Check for duplicates
+nrow(df)  # Total rows
+nrow(distinct(df))  # Unique rows
+```
+```{r}
+# Remove exact duplicate rows only
+df <- df |> 
+  distinct()
+nrow(df)
+```
+
+
+```{r}
+# trim spaces in character columns
+df <- df |> 
+  mutate(across(where(is.character), trimws))
+
+# Remove completely empty strings
+df <- df |> 
+  mutate(across(where(is.character), ~na_if(., "")))
+```
+
+
+```{r}
+# make a new column Revenue as the product of price and quantity
+df <- df |> 
+  mutate(Revenue = Price * Quantity)
+
+# convert InvoiceDate to Date format
+df$InvoiceDate <- as.Date(df$InvoiceDate)
+```
+
+
+```{r}
+head(df)
+```
+
+```{r}
+# Fill NAs in Description with the most common description for each StockCode
+df <- df |> 
+  group_by(StockCode) |> 
+  mutate(
+    Description = ifelse(is.na(Description), 
+                        first(Description[!is.na(Description)]), 
+                        Description)
+  ) |> 
+  ungroup()
+
+# check null results now
+df |> 
+  filter(is.na(Description)) |> 
+  nrow()
+colSums(is.na(df))
+```
+```{r}
+# See which StockCodes still have null descriptions
+null_by_stockcode <- df |> 
+  filter(is.na(Description)) |> 
+  group_by(StockCode) |> 
+  summarise(
+    Count = n(),
+    Sample_Invoice = first(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Count))
+
+print(null_by_stockcode)
+```
+
+
+```{r}
+# Remove POST and DOT, postage isn't a product they actually sell, they just charge for it
+
+df <- df |> 
+  filter(!StockCode %in% c("POST", "DOT"))
+
+# Verify they're gone
+df |> 
+  filter(StockCode %in% c("POST", "DOT")) |> 
+  nrow()  
+
+```
+
+
+```{r}
+# negative quantities I don't want to necessarily completely delete since they may be useful
+# Separate returns/adjustments from regular sales
+# df will be the sales df 
+returns_df <- df |> 
+  filter(Quantity < 0)
+
+df <- df |> 
+  filter(Quantity > 0)
+
+```
+
+```{r}
+# View all rows with negative quantities
+
+# See how many there are
+nrow(returns_df)
+
+# View them
+head(returns_df)
+```
+
+```{r}
+# looks like for some of them it's the same customer doing the negative quantity
+returns_df %>% 
+  dplyr::select("Customer ID", "Invoice", "StockCode", "Description", "Quantity", "Price", "Country", "InvoiceDate")
+```
+
+
+```{r}
+# rows with 0 price, don't want to completely get rid of them in case we need them later
+# the 0 price rows also have some with no description, but they do have quantities
+# Save zero-price rows to separate dataset
+zero_price_df <- df |> 
+  filter(Price == 0)
+
+# Remove zero-price rows from df
+df <- df |> 
+  filter(Price > 0)
+
+# Verify
+cat("Zero price dataset:", nrow(zero_price_df), "rows\n")
+cat("Main dataset:", nrow(df), "rows\n")
+cat("Total:", nrow(zero_price_df) + nrow(df), "rows\n")
+```
+```{r}
+# View all rows with negative prices
+# Description says adjust bad debt, maybe some kind of charge back
+# They have a stock code of just B
+
+# See how many there are
+nrow(zero_price_df)
+
+# View them
+head(zero_price_df)
+```
+
+B = Bad debt
+
+```{r}
+# Remove B stock code
+df <- df |> 
+  filter(!StockCode %in% c("B"))
+```
+
+
+
+# More EDA
+
+```{r}
+# See the earliest and latest dates
+# Spans 2 years
+range(df$InvoiceDate, na.rm = TRUE)
+```
+
+```{r}
+# Unique Products
+unique_products <- n_distinct(df$StockCode)
+cat("Unique Products:", unique_products, "\n")
+
+# Unique Customers
+unique_customers <- n_distinct(df$`Customer ID`, na.rm = TRUE)
+cat("Unique Customers:", unique_customers, "\n")
+
+# Unique Countries
+unique_countries <- n_distinct(df$Country)
+cat("Unique Countries:", unique_countries, "\n")
+
+# Unique Transactions
+unique_transactions <- n_distinct(df$Invoice)
+cat("Unique Transactions:", unique_transactions, "\n")
+```
+```{r}
+# Monthly, weekly transactions
+
+# Monthly transaction counts
+monthly_transactions <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_transactions)
+
+# Average per month
+cat("\nAverage Transactions per Month:", 
+    round(mean(monthly_transactions$Transactions), 1), "\n")
+
+# Weekly transaction counts
+weekly_transactions <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(head(weekly_transactions))
+
+# Average per week
+cat("Average Transactions per Week:", 
+    round(mean(weekly_transactions$Transactions), 1), "\n")
+```
+
+
+# What are the top-selling products?
+
+```{r}
+# top selling products
+# M is manual, you can't track what M is
+# 22423, 85123A, M
+df |> 
+  group_by(StockCode) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+
+```{r}
+df |> 
+  filter(!is.na(Description)) |>  # Remove rows with NA descriptions
+  group_by(StockCode) |> 
+  summarise(
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    Description = first(Description)  # Get first description for each StockCode
+  ) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>
+  ggplot(aes(x = reorder(Description, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Products by Total Revenue",
+       x = "Product Description",
+       y = "Total Revenue") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+# Product Sales & Sales Analysis
+
+
+```{r}
+# Identify top-selling products by quantity
+top_products <- df |> 
+  group_by(StockCode, Description) |> 
+  summarise(
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  filter(!is.na(Description), Total_Quantity_Sold > 0) |> 
+  arrange(desc(Total_Quantity_Sold)) |> 
+  head(10)
+
+print(top_products)
+
+# Select top 3-5 products for forecasting
+key_stockcodes <- top_products$StockCode[1:5]
+
+# Bar chart for Quantity
+avg_quantity <- mean(top_products$Total_Quantity_Sold)
+
+ggplot(top_products, aes(x = reorder(Description, Total_Quantity_Sold), y = Total_Quantity_Sold)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = avg_quantity, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 5, y = avg_quantity, label = paste("Avg:", format(avg_quantity, big.mark = ",")), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(labels = comma_format()) +
+  labs(
+    title = "Top 10 Products by Quantity Sold",
+    x = "Product Description",
+    y = "Total Quantity Sold"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.y = element_text(size = 9)
+  )
+
+# Identify top-selling products by revenue (US $)
+top_products_revenue <- df |> 
+  group_by(StockCode, Description) |> 
+  summarise(
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  filter(!is.na(Description), Total_Revenue > 0) |> 
+  arrange(desc(Total_Revenue)) |> 
+  head(10)
+
+print(top_products_revenue)
+
+# Bar chart for Revenue
+avg_revenue <- mean(top_products_revenue$Total_Revenue)
+
+ggplot(top_products_revenue, aes(x = reorder(Description, Total_Revenue), y = Total_Revenue)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  geom_hline(yintercept = avg_revenue, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 5, y = avg_revenue, label = paste("Avg:", dollar(avg_revenue)), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Top 10 Products by Revenue (US $)",
+    x = "Product Description",
+    y = "Total Revenue"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.y = element_text(size = 9)
+  )
+```
+```{r}
+#Top 10 declining products in quantity
+
+# Calculate quarterly sales trends for each product
+product_trends <- df %>%
+  mutate(Quarter = quarter(InvoiceDate, with_year = TRUE)) %>%
+  group_by(StockCode, Description, Quarter) %>%
+  summarise(
+    Quarterly_Quantity = sum(Quantity, na.rm = TRUE),
+    Quarterly_Revenue = sum(Revenue, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(Description), Quarterly_Quantity > 0)
+
+# Calculate quantity decline from first to last quarter for each product
+declining_products <- product_trends %>%
+  group_by(StockCode, Description) %>%
+  arrange(Quarter) %>%
+  summarise(
+    First_Quarter = first(Quarter),
+    Last_Quarter = last(Quarter),
+    First_Quarter_Qty = first(Quarterly_Quantity),
+    Last_Quarter_Qty = last(Quarterly_Quantity),
+    Total_Revenue = sum(Quarterly_Revenue),
+    Num_Quarters = n(),
+    Quantity_Decline = first(Quarterly_Quantity) - last(Quarterly_Quantity),
+    .groups = 'drop'
+  ) %>%
+  filter(Num_Quarters >= 3, Total_Revenue > 1000) %>%  # At least 3 quarters and significant revenue
+  arrange(desc(Quantity_Decline)) %>%
+  filter(Quantity_Decline > 0) %>%  # Products with positive decline (losing sales)
+  head(10)
+
+print(declining_products)
+
+# Calculate average decline
+avg_decline <- mean(declining_products$Quantity_Decline)
+
+# Visualize declining products
+ggplot(declining_products, aes(x = reorder(Description, Quantity_Decline), y = Quantity_Decline)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  geom_hline(yintercept = avg_decline, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 5, y = avg_decline, label = paste("Avg:", format(round(avg_decline), big.mark = ",")), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(labels = comma_format()) +
+  labs(
+    title = "Top 10 Declining Products by Quantity Decline",
+    subtitle = "Difference Between First Quarter and Last Quarter Sales",
+    x = "Product Description",
+    y = "Quantity Decline"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.y = element_text(size = 8)
+  )
+```
+```{r}
+
+# Extract date components for seasonal analysis
+seasonal_data <- df |> 
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate, label = TRUE),
+    Month_Num = month(InvoiceDate),
+    Quarter = quarter(InvoiceDate),
+    Week = week(InvoiceDate),
+    Day_of_Week = wday(InvoiceDate, label = TRUE)
+  )
+
+# 1. Monthly Revenue Trends
+monthly_revenue <- seasonal_data |> 
+  group_by(Year, Month, Month_Num) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(Year, Month_Num)
+
+print("Monthly Revenue Summary:")
+print(monthly_revenue)
+
+# Calculate average monthly revenue
+avg_monthly_revenue <- mean(monthly_revenue$Total_Revenue)
+
+# Plot 1: Monthly Revenue Pattern
+ggplot(monthly_revenue, aes(x = Month, y = Total_Revenue, fill = as.factor(Year))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = avg_monthly_revenue, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 6, y = avg_monthly_revenue, 
+           label = paste("Avg:", dollar(avg_monthly_revenue)), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Monthly Revenue Patterns - Identifying Seasonal Trends",
+    subtitle = "Comparison Across Years",
+    x = "Month",
+    y = "Total Revenue",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# 2. Aggregate monthly patterns across all years
+monthly_aggregate <- seasonal_data |> 
+  group_by(Month, Month_Num) |> 
+  summarise(
+    Avg_Revenue = mean(Revenue, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Avg_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(Month_Num)
+
+print("\nAggregate Monthly Patterns:")
+print(monthly_aggregate)
+
+# Calculate overall average
+overall_avg <- mean(monthly_aggregate$Total_Revenue)
+
+# Plot 2: Average Monthly Revenue (All Years Combined)
+ggplot(monthly_aggregate, aes(x = Month, y = Total_Revenue)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = overall_avg, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 6, y = overall_avg, 
+           label = paste("Avg:", dollar(overall_avg)), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Seasonal Revenue Pattern - All Years Combined",
+    subtitle = "Clear identification of peak and low seasons",
+    x = "Month",
+    y = "Total Revenue"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# 3. Quarterly Analysis
+quarterly_patterns <- seasonal_data |> 
+  group_by(Year, Quarter) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  )
+
+print("\nQuarterly Patterns:")
+print(quarterly_patterns)
+
+# Calculate average quarterly revenue
+avg_quarterly_revenue <- mean(quarterly_patterns$Total_Revenue)
+
+# Plot 3: Quarterly Revenue
+ggplot(quarterly_patterns, aes(x = factor(Quarter), y = Total_Revenue, fill = as.factor(Year))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = avg_quarterly_revenue, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 2, y = avg_quarterly_revenue, 
+           label = paste("Avg:", dollar(avg_quarterly_revenue)), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Quarterly Revenue Patterns",
+    subtitle = "Q1-Q4 Performance Comparison",
+    x = "Quarter",
+    y = "Total Revenue",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "bottom"
+  )
+
+# 4. Day of Week Analysis
+weekday_patterns <- seasonal_data |> 
+  group_by(Day_of_Week) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    Avg_Order_Value = Total_Revenue / Num_Orders,
+    .groups = 'drop'
+  )
+
+print("\nDay of Week Patterns:")
+print(weekday_patterns)
+
+# Calculate average daily revenue
+avg_daily_revenue <- mean(weekday_patterns$Total_Revenue)
+
+# Plot 4: Day of Week Pattern
+ggplot(weekday_patterns, aes(x = Day_of_Week, y = Total_Revenue)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  geom_hline(yintercept = avg_daily_revenue, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = 4, y = avg_daily_revenue, 
+           label = paste("Avg:", dollar(avg_daily_revenue)), 
+           vjust = -0.5, color = "red", fontface = "bold") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Revenue by Day of Week",
+    subtitle = "Weekly purchase patterns",
+    x = "Day of Week",
+    y = "Total Revenue"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# 5. Identify peak months
+peak_analysis <- monthly_aggregate |> 
+  mutate(
+    Pct_of_Avg = (Total_Revenue / overall_avg - 1) * 100,
+    Category = case_when(
+      Pct_of_Avg >= 50 ~ "Peak Season (>50% above avg)",
+      Pct_of_Avg >= 20 ~ "High Season (20-50% above avg)",
+      Pct_of_Avg >= -20 ~ "Normal Season",
+      TRUE ~ "Low Season (<20% below avg)"
+    )
+  ) |> 
+  arrange(desc(Total_Revenue))
+
+print("\nPeak Season Analysis:")
+print(peak_analysis)
+
+# Plot 5: Percentage deviation from average
+ggplot(peak_analysis, aes(x = Month, y = Pct_of_Avg, fill = Category)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = 0, color = "black", size = 1) +
+  scale_fill_manual(values = c("Peak Season (>50% above avg)" = "darkred",
+                                "High Season (20-50% above avg)" = "orange",
+                                "Normal Season" = "steelblue",
+                                "Low Season (<20% below avg)" = "lightblue")) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Seasonal Deviation from Average Revenue",
+    subtitle = "Percentage above/below average monthly revenue",
+    x = "Month",
+    y = "% Deviation from Average",
+    fill = "Season Category"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# 6. Statistical Summary and Findings
+cat("\n========================================")
+cat("\n    SEASONAL PATTERN FINDINGS")
+cat("\n========================================\n")
+
+# Find peak months
+peak_months <- peak_analysis |> filter(Pct_of_Avg >= 20) |> pull(Month)
+low_months <- peak_analysis |> filter(Pct_of_Avg < -20) |> pull(Month)
+
+cat("\n1. PEAK SEASONS:")
+cat("\n   - Peak months:", paste(peak_months, collapse = ", "))
+cat("\n   - These months show 20%+ above average revenue")
+cat("\n   - Highest revenue month:", as.character(peak_analysis$Month[1]), 
+    "with", dollar(peak_analysis$Total_Revenue[1]))
+
+cat("\n\n2. LOW SEASONS:")
+cat("\n   - Low months:", paste(low_months, collapse = ", "))
+cat("\n   - These months show 20%+ below average revenue")
+cat("\n   - Lowest revenue month:", as.character(peak_analysis$Month[nrow(peak_analysis)]), 
+    "with", dollar(peak_analysis$Total_Revenue[nrow(peak_analysis)]))
+
+cat("\n\n3. QUARTERLY INSIGHTS:")
+best_quarter <- quarterly_patterns |> arrange(desc(Total_Revenue)) |> slice(1)
+cat("\n   - Best performing quarter: Q", best_quarter$Quarter[1], 
+    "in", best_quarter$Year[1])
+cat("\n   - Revenue:", dollar(best_quarter$Total_Revenue[1]))
+
+cat("\n\n4. WEEKLY PATTERNS:")
+best_day <- weekday_patterns |> arrange(desc(Total_Revenue)) |> slice(1)
+worst_day <- weekday_patterns |> arrange(Total_Revenue) |> slice(1)
+cat("\n   - Highest revenue day:", as.character(best_day$Day_of_Week), 
+    "-", dollar(best_day$Total_Revenue))
+cat("\n   - Lowest revenue day:", as.character(worst_day$Day_of_Week), 
+    "-", dollar(worst_day$Total_Revenue))
+
+cat("\n\n5. HOLIDAY SPIKE ANALYSIS:")
+# Check for November-December spike (holiday season)
+nov_dec <- monthly_aggregate |> filter(Month_Num %in% c(11, 12))
+if(nrow(nov_dec) > 0) {
+  nov_dec_avg <- mean(nov_dec$Total_Revenue)
+  holiday_spike <- ((nov_dec_avg / overall_avg) - 1) * 100
+  cat("\n   - November-December average revenue:", dollar(nov_dec_avg))
+  cat("\n   - Holiday spike:", round(holiday_spike, 1), "% above annual average")
+  if(holiday_spike > 20) {
+    cat("\n   - FINDING: Strong holiday shopping pattern detected!")
+  }
+}
+
+cat("\n\n6. RECOMMENDATIONS:")
+cat("\n   - Stock up inventory 1-2 months before peak seasons")
+cat("\n   - Plan promotional campaigns during low seasons to boost sales")
+cat("\n   - Allocate more staff during peak months:", paste(peak_months, collapse = ", "))
+cat("\n   - Consider clearance sales during low months:", paste(low_months, collapse = ", "))
+cat("\n========================================\n\n")
+```
+
+
+
+```{r}
+
+# Prepare monthly demand for top products
+
+forecast_data <- df |> 
+  filter(StockCode %in% key_stockcodes) |> 
+  mutate(Month = floor_date(InvoiceDate, "month")) |> 
+  group_by(StockCode, Description, Month) |> 
+  summarise(
+    Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Revenue = sum(Revenue, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Function to create forecast for a single product
+forecast_product <- function(stock_code, data, months_ahead = 6) {
+  
+  # Filter data for specific product
+  product_data <- data |> 
+    filter(StockCode == stock_code) |> 
+    arrange(Month)
+  
+  product_name <- product_data$Description[1]
+  
+  # Create time series
+  ts_data <- ts(product_data$Quantity_Sold, 
+                start = c(year(min(product_data$Month)), month(min(product_data$Month))),
+                frequency = 12)
+  
+  # Fit ARIMA model
+  fit <- auto.arima(ts_data)
+  
+  # Generate forecast
+  forecasted <- forecast(fit, h = months_ahead)
+  
+  # Create forecast dataframe
+  last_date <- max(product_data$Month)
+  forecast_dates <- seq(last_date + months(1), by = "month", length.out = months_ahead)
+  
+  forecast_df <- data.frame(
+    StockCode = stock_code,
+    Description = product_name,
+    Month = forecast_dates,
+    Forecasted_Quantity = as.numeric(forecasted$mean),
+    Lower_80 = as.numeric(forecasted$lower[,1]),
+    Upper_80 = as.numeric(forecasted$upper[,1]),
+    Lower_95 = as.numeric(forecasted$lower[,2]),
+    Upper_95 = as.numeric(forecasted$upper[,2])
+  )
+  
+  return(list(
+    historical = product_data,
+    forecast = forecast_df,
+    model = fit,
+    forecast_obj = forecasted
+  ))
+}
+
+# Generate forecasts for all key products
+all_forecasts <- lapply(key_stockcodes, function(code) {
+  forecast_product(code, forecast_data, months_ahead = 6)
+})
+
+# Print forecast summaries
+cat("\n=== DEMAND FORECASTS FOR KEY PRODUCTS ===\n\n")
+for(i in 1:length(all_forecasts)) {
+  cat("\nProduct:", all_forecasts[[i]]$forecast$Description[1], "\n")
+  cat("Stock Code:", all_forecasts[[i]]$forecast$StockCode[1], "\n")
+  print(all_forecasts[[i]]$forecast[, c("Month", "Forecasted_Quantity", "Lower_95", "Upper_95")])
+  cat("\nModel Summary:\n")
+  print(all_forecasts[[i]]$model)
+  cat("\n", rep("-", 80), "\n")
+}
+
+# Visualize forecasts for each product
+for(i in 1:length(all_forecasts)) {
+  
+  historical <- all_forecasts[[i]]$historical
+  forecast_df <- all_forecasts[[i]]$forecast
+  product_name <- forecast_df$Description[1]
+  
+  # Combine historical and forecast data
+  combined_data <- bind_rows(
+    historical |> mutate(Type = "Historical"),
+    forecast_df |> dplyr::select(Month, Quantity_Sold = Forecasted_Quantity) |> mutate(Type = "Forecast")
+  )
+  
+  # Create plot
+  p <- ggplot() +
+    # Historical data
+    geom_line(data = historical, aes(x = Month, y = Quantity_Sold), 
+              color = "steelblue", size = 1.2) +
+    geom_point(data = historical, aes(x = Month, y = Quantity_Sold), 
+               color = "steelblue", size = 2) +
+    
+    # Forecast data
+    geom_line(data = forecast_df, aes(x = Month, y = Forecasted_Quantity), 
+              color = "red", size = 1.2, linetype = "dashed") +
+    geom_point(data = forecast_df, aes(x = Month, y = Forecasted_Quantity), 
+               color = "red", size = 2) +
+    
+    # Confidence intervals
+    geom_ribbon(data = forecast_df, aes(x = Month, ymin = Lower_95, ymax = Upper_95), 
+                alpha = 0.2, fill = "red") +
+    geom_ribbon(data = forecast_df, aes(x = Month, ymin = Lower_80, ymax = Upper_80), 
+                alpha = 0.3, fill = "red") +
+    
+    scale_y_continuous(labels = comma_format()) +
+    scale_x_date(date_breaks = "2 months", date_labels = "%b %Y") +
+    labs(
+      title = paste("Demand Forecast:", product_name),
+      subtitle = "Historical Data (Blue) vs 6-Month Forecast (Red) with 80% and 95% Confidence Intervals",
+      x = "Month",
+      y = "Quantity Demanded"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  print(p)
+}
+
+# Create summary table of forecasts
+forecast_summary <- bind_rows(lapply(all_forecasts, function(x) {
+  x$forecast |> 
+    group_by(StockCode, Description) |> 
+    summarise(
+      Avg_Monthly_Forecast = mean(Forecasted_Quantity),
+      Total_6Month_Forecast = sum(Forecasted_Quantity),
+      Min_Forecast = min(Lower_95),
+      Max_Forecast = max(Upper_95),
+      .groups = 'drop'
+    )
+}))
+
+cat("\n=== FORECAST SUMMARY TABLE ===\n")
+print(forecast_summary)
+
+# Stock management recommendations
+cat("\n=== STOCK MANAGEMENT RECOMMENDATIONS ===\n\n")
+for(i in 1:nrow(forecast_summary)) {
+  cat("Product:", forecast_summary$Description[i], "\n")
+  cat("  - Average Monthly Demand (Next 6 Months):", round(forecast_summary$Avg_Monthly_Forecast[i]), "units\n")
+  cat("  - Total Demand (Next 6 Months):", round(forecast_summary$Total_6Month_Forecast[i]), "units\n")
+  cat("  - Recommended Safety Stock:", round(forecast_summary$Max_Forecast[i] * 1.1), "units\n")
+  cat("  - Suggested Reorder Point:", round(forecast_summary$Avg_Monthly_Forecast[i] * 1.5), "units\n\n")
+}
+```
+
+
+```{r}
+# Monthly demand for top products
+monthly_demand <- df |> 
+  filter(StockCode %in% top_products$StockCode) |> 
+  mutate(Month = floor_date(InvoiceDate, "month")) |> 
+  group_by(StockCode, Description, Month) |> 
+  summarise(
+    Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  )
+print(monthly_demand)
+```
+
+
