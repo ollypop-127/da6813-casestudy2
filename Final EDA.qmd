@@ -1,0 +1,769 @@
+---
+title: "EDA Final"
+format: html
+editor: source
+---
+
+```{r}
+library(MASS)
+library(caret)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(car)
+library(sqldf)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(cluster)
+library(gridExtra)
+```
+
+# EDA
+
+```{r}
+df <- bind_rows(
+  read_excel("online_retail.xlsx", sheet = "Year 2009-2010"),
+  read_excel("online_retail.xlsx", sheet = "Year 2010-2011"))
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+str(df)
+```
+Categorical Variables:
+Invoice
+StockCode
+Description
+Country
+InvoiceDate
+
+Numerical Variables:
+Quantity
+Price
+Customer ID
+
+
+```{r}
+# check for NA's
+# Description NA's... those products still matter but what are they
+colSums(is.na(df))
+```
+Customer ID is missing a ton of values, does that mean those aren't sales? the quantity still changes so there were sales that existed but for some reason there aren't Customer ID's, not sure what that indicates
+
+# Data Cleaning
+
+## Important: Stock code M will need to be removed when modeling stock
+M is manual override. For some reason, the product information was lost but the sales, quantity, and customer info was retained for that sale. Keeping M in for the meantime to accurately track sales and customer spending. Weird however that on an online store isn't accurately tracking the stock being bought.
+
+df <- df |> 
+  filter(!StockCode %in% c("M"))
+
+
+```{r}
+# Check for duplicates
+nrow(df)  # Total rows
+nrow(distinct(df))  # Unique rows
+```
+```{r}
+# Remove exact duplicate rows only
+df <- df |> 
+  distinct()
+nrow(df)
+```
+
+
+```{r}
+# trim spaces in character columns
+df <- df |> 
+  mutate(across(where(is.character), trimws))
+
+# Remove completely empty strings
+df <- df |> 
+  mutate(across(where(is.character), ~na_if(., "")))
+```
+
+
+```{r}
+# make a new column Revenue as the product of price and quantity
+df <- df |> 
+  mutate(Revenue = Price * Quantity)
+
+# convert InvoiceDate to Date format
+df$InvoiceDate <- as.Date(df$InvoiceDate)
+```
+
+
+```{r}
+head(df)
+```
+
+```{r}
+# Fill NAs in Description with the most common description for each StockCode
+df <- df |> 
+  group_by(StockCode) |> 
+  mutate(
+    Description = ifelse(is.na(Description), 
+                        first(Description[!is.na(Description)]), 
+                        Description)
+  ) |> 
+  ungroup()
+
+# check null results now
+df |> 
+  filter(is.na(Description)) |> 
+  nrow()
+colSums(is.na(df))
+```
+```{r}
+# See which StockCodes still have null descriptions
+null_by_stockcode <- df |> 
+  filter(is.na(Description)) |> 
+  group_by(StockCode) |> 
+  summarise(
+    Count = n(),
+    Sample_Invoice = first(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Count))
+
+print(null_by_stockcode)
+```
+
+
+```{r}
+# Remove POST and DOT, postage isn't a product they actually sell, they just charge for it
+
+df <- df |> 
+  filter(!StockCode %in% c("POST", "DOT"))
+
+# Verify they're gone
+df |> 
+  filter(StockCode %in% c("POST", "DOT")) |> 
+  nrow()  
+
+```
+
+
+```{r}
+# negative quantities I don't want to necessarily completely delete since they may be useful
+# Separate returns/adjustments from regular sales
+# df will be the sales df 
+returns_df <- df |> 
+  filter(Quantity < 0)
+
+df <- df |> 
+  filter(Quantity > 0)
+
+```
+
+```{r}
+# View all rows with negative quantities
+
+# See how many there are
+nrow(returns_df)
+
+# View them
+head(returns_df)
+```
+
+```{r}
+# looks like for some of them it's the same customer doing the negative quantity
+returns_df |> 
+  select(`Customer ID`, Invoice, StockCode, Description, Quantity, Price, Country, InvoiceDate)
+
+```
+
+
+```{r}
+# rows with 0 price, don't want to completely get rid of them in case we need them later
+# the 0 price rows also have some with no description, but they do have quantities
+# Save zero-price rows to separate dataset
+zero_price_df <- df |> 
+  filter(Price == 0)
+
+# Remove zero-price rows from df
+df <- df |> 
+  filter(Price > 0)
+
+# Verify
+cat("Zero price dataset:", nrow(zero_price_df), "rows\n")
+cat("Main dataset:", nrow(df), "rows\n")
+cat("Total:", nrow(zero_price_df) + nrow(df), "rows\n")
+```
+```{r}
+# View all rows with negative prices
+# Description says adjust bad debt, maybe some kind of charge back
+# They have a stock code of just B
+
+# See how many there are
+nrow(zero_price_df)
+
+# View them
+head(zero_price_df)
+```
+
+B = Bad debt
+
+```{r}
+# Remove B stock code
+df <- df |> 
+  filter(!StockCode %in% c("B"))
+```
+
+
+
+# More EDA
+
+```{r}
+# See the earliest and latest dates
+# Spans 2 years
+range(df$InvoiceDate, na.rm = TRUE)
+```
+
+```{r}
+# Unique Products
+unique_products <- n_distinct(df$StockCode)
+cat("Unique Products:", unique_products, "\n")
+
+# Unique Customers
+unique_customers <- n_distinct(df$`Customer ID`, na.rm = TRUE)
+cat("Unique Customers:", unique_customers, "\n")
+
+# Unique Countries
+unique_countries <- n_distinct(df$Country)
+cat("Unique Countries:", unique_countries, "\n")
+
+# Unique Transactions
+unique_transactions <- n_distinct(df$Invoice)
+cat("Unique Transactions:", unique_transactions, "\n")
+```
+```{r}
+# Monthly, weekly transactions
+
+# Monthly transaction counts
+monthly_transactions <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_transactions)
+
+# Average per month
+cat("\nAverage Transactions per Month:", 
+    round(mean(monthly_transactions$Transactions), 1), "\n")
+
+# Weekly transaction counts
+weekly_transactions <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(head(weekly_transactions))
+
+# Average per week
+cat("Average Transactions per Week:", 
+    round(mean(weekly_transactions$Transactions), 1), "\n")
+```
+
+```{r}
+# Monthly weekly Revenue
+
+# Monthly revenue
+monthly_revenue <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(monthly_revenue)
+
+# Average per month
+cat("\nAverage Revenue per Month: £", 
+    format(round(mean(monthly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+
+# Weekly revenue
+weekly_revenue <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(head(weekly_revenue, 20))
+
+# Average per week
+cat("Average Revenue per Week: £", 
+    format(round(mean(weekly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+```
+
+
+
+# Which countries contribute the most to Sales growth?
+UK, Ireland, Netherlands, Germany, France
+
+```{r}
+# revenue by country
+# Most of the distribution is in the UK and the rest of Europe
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+```{r}
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>  # top 5
+  ggplot(aes(x = reorder(Country, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Countries by Total Revenue",
+       x = "Country",
+       y = "Total Revenue") +
+  theme_minimal()
+```
+
+# What are the top-selling products?
+
+```{r}
+# top selling products
+# M is manual, you can't track what M is
+# 22423, 85123A, M
+df |> 
+  group_by(StockCode) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+
+```{r}
+df |> 
+  filter(!is.na(Description)) |>  # Remove rows with NA descriptions
+  group_by(StockCode) |> 
+  summarise(
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    Description = first(Description)  # Get first description for each StockCode
+  ) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>
+  ggplot(aes(x = reorder(Description, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Products by Total Revenue",
+       x = "Product Description",
+       y = "Total Revenue") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+
+```{r}
+# revenue grouped by customer
+# most of the revenue doesn't have a customer ID, who is buying all of this then
+# Highest buying customers, 18102, 14646
+df |> 
+  group_by(`Customer ID`) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+
+
+# Time Series
+
+```{r}
+# Create daily sales summary
+daily_sales <- df |> 
+  group_by(InvoiceDate) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(InvoiceDate)
+
+head(daily_sales)
+summary(daily_sales)
+```
+
+
+```{r}
+# Create monthly sales summary
+monthly_sales <- df |> 
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate),
+    YearMonth = floor_date(InvoiceDate, "month")  # First day of each month
+  ) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(YearMonth)
+
+# View monthly data
+print(monthly_sales)
+
+# Plot monthly sales
+ggplot(monthly_sales, aes(x = YearMonth, y = Num_Transactions)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 3) +
+  labs(title = "Monthly Sales Transactions",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot monthly revenue
+ggplot(monthly_sales, aes(x = YearMonth, y = Total_Revenue)) +
+  geom_line(color = "darkgreen", size = 1.2) +
+  geom_point(color = "darkgreen", size = 3) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Monthly Revenue",
+       x = "Month",
+       y = "Total Revenue (£)") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+# monthly sales and transactions
+monthly_sales <- monthly_sales |> 
+  mutate(
+    Revenue_Scaled = Total_Revenue / max(Total_Revenue) * max(Num_Transactions)
+  )
+
+ggplot(monthly_sales, aes(x = YearMonth)) +
+  # Revenue bars
+  geom_col(aes(y = Revenue_Scaled), fill = "lightgreen", alpha = 0.7) +
+  # Transaction line
+  geom_line(aes(y = Num_Transactions), color = "steelblue", size = 1.5) +
+  geom_point(aes(y = Num_Transactions), color = "steelblue", size = 3) +
+  labs(title = "Sales Transactions and Revenue Over Time",
+       subtitle = "Blue line: Transactions | Green bars: Revenue",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Product Sales
+
+
+```{r}
+
+# Identify top-selling products by quantity
+top_products <- df |> 
+  group_by(StockCode, Description) |> 
+  summarise(
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  filter(!is.na(Description), Total_Quantity_Sold > 0) |> 
+  arrange(desc(Total_Quantity_Sold)) |> 
+  head(10)
+
+print(top_products)
+
+# Select top 3-5 products for forecasting
+key_stockcodes <- top_products$StockCode[1:5]
+```
+
+```{r}
+# Monthly demand for top products
+monthly_demand <- df |> 
+  filter(StockCode %in% top_products$StockCode) |> 
+  mutate(Month = floor_date(InvoiceDate, "month")) |> 
+  group_by(StockCode, Description, Month) |> 
+  summarise(
+    Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_demand)
+```
+
+
+# Seasonal buying patterns
+
+Percentage shows what proportion of that product's total annual revenue came from that specific season.
+
+```{r}
+# extract month from InvoiceDate
+df <- df |> 
+  mutate(
+    Month = month(InvoiceDate, label = TRUE),
+    Month_Num = month(InvoiceDate),
+    Year = year(InvoiceDate)
+  )
+
+# Define the seasonal periods you want to analyze
+seasonal_analysis <- df |> 
+  mutate(
+    Season_Period = case_when(
+      Month_Num %in% c(2, 3) ~ "Feb-Mar Spike",
+      Month_Num %in% c(4, 5) ~ "Apr-May Spike",
+      Month_Num %in% c(8, 9, 10, 11, 12) ~ "Aug-Dec (Holiday Season)",
+      TRUE ~ "Other Months"
+    )
+  )
+
+# Top products by season
+top_products_by_season <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  group_by(Season_Period, Description) |> 
+  summarise(
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    Avg_Price = mean(Price, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 20) |>  # Top 20 products per season
+  ungroup()
+
+print(top_products_by_season)
+
+# Compare revenue by season period
+season_revenue_summary <- seasonal_analysis |> 
+  group_by(Season_Period) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Orders = n_distinct(Invoice),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Unique_Products = n_distinct(StockCode),
+    Avg_Order_Value = Total_Revenue / Total_Orders,
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Total_Revenue))
+
+print(season_revenue_summary)
+
+# Look for products that are UNIQUE to spike periods
+# (appear heavily in spike months but not in other months)
+spike_specific_products <- seasonal_analysis |> 
+  group_by(Description, Season_Period) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    Quantity = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  pivot_wider(
+    names_from = Season_Period,
+    values_from = c(Revenue, Quantity),
+    values_fill = 0
+  ) |> 
+  # Calculate what % of product's revenue comes from each season
+  mutate(
+    Total_Revenue = `Revenue_Feb-Mar Spike` + `Revenue_Apr-May Spike` + 
+                    `Revenue_Aug-Dec (Holiday Season)` + `Revenue_Other Months`,
+    FebMar_Pct = round(`Revenue_Feb-Mar Spike` / Total_Revenue * 100, 1),
+    AprMay_Pct = round(`Revenue_Apr-May Spike` / Total_Revenue * 100, 1),
+    AugDec_Pct = round(`Revenue_Aug-Dec (Holiday Season)` / Total_Revenue * 100, 1)
+  ) |> 
+  filter(Total_Revenue > 1000) |>  # Only products with meaningful revenue
+  arrange(desc(FebMar_Pct))
+
+# Products heavily concentrated in Feb-Mar
+febmar_products <- spike_specific_products |> 
+  filter(FebMar_Pct >= 40) |>  # 40%+ of revenue in Feb-Mar
+  select(Description, FebMar_Pct, `Revenue_Feb-Mar Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Feb-Mar Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN FEB-MAR ===")
+print(head(febmar_products, 15))
+
+# Products heavily concentrated in Apr-May
+aprmay_products <- spike_specific_products |> 
+  filter(AprMay_Pct >= 40) |>
+  select(Description, AprMay_Pct, `Revenue_Apr-May Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Apr-May Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN APR-MAY ===")
+print(head(aprmay_products, 15))
+
+# Products heavily concentrated in Aug-Dec
+augdec_products <- spike_specific_products |> 
+  filter(AugDec_Pct >= 60) |>  # Higher threshold since this is longer period
+  select(Description, AugDec_Pct, `Revenue_Aug-Dec (Holiday Season)`, Total_Revenue) |>
+  arrange(desc(`Revenue_Aug-Dec (Holiday Season)`))
+
+print("=== PRODUCTS CONCENTRATED IN AUG-DEC ===")
+print(head(augdec_products, 15))
+
+# Look at product keywords/themes
+# Extract common words from product descriptions in each season
+library(tidytext)
+
+season_keywords <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  select(Season_Period, Description, Revenue) |> 
+  unnest_tokens(word, Description) |> 
+  anti_join(stop_words, by = "word") |>  # Remove common words like "the", "and"
+  filter(!word %in% c("set", "pack", "vintage", "red", "white", "blue", "pink")) |>  # Remove generic words
+  group_by(Season_Period, word) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Count = n(),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 15)
+
+print("=== TOP KEYWORDS BY SEASON ===")
+print(season_keywords)
+```
+
+# Results
+Overall Revenue Distribution:
+
+Aug-Dec (Holiday Season): $9.1M (53%) - Dominates as expected
+Apr-May Spike: $2.3M (13%)
+Feb-Mar Spike: $2.2M (13%)
+Other Months: $3.6M (21%)
+
+
+Feb-Mar Spike Products -Valentine's & Early Spring
+
+Key Themes:
+Red & Hearts - Valentine's Day focus
+Door Mat Hearts (52.4% of sales in Feb-Mar)
+Pack of 12 Red Spotty Tissues (51.7%)
+Jumbo Bag Red White Spotty (42.3%)
+
+Home Decor - Spotty/Polka Dot Pattern
+Door mats with spots (multiple variations 40-60% concentrated)
+Retro Spot Cake Stand (41.3%)
+These appear to be spring/fresh design themes
+
+
+Easter Prep Beginning
+Easter Craft 4 Chicks (66.9%)
+Small Fairy Cake Fridge Magnets (94.2%) - likely spring/Easter themed
+
+
+February-March spike is driven by Valentine's Day (hearts, red colors) and early Easter/spring preparation (craft items, fresh spotty patterns). 
+
+Apr-May Spike Products (Easter, Gardening, Outdoor Season)
+Key Themes:
+
+Outdoor/Garden Products - Spring gardening season
+Wooden Rounders Garden Set (48.9% - $10,263!)
+Wooden Croquet Garden Set (40.9%)
+Wooden Skittles Garden Set (51.9%)
+Gardeners Kneeling Pad (45.7%)
+Watering Can Green Dinosaur (43.1%)
+
+Picnic/Outdoor Dining
+Picnic Basket Wicker Large (42.3%)
+Set of 4 New England Placemats (91.5%)
+
+Outdoor Décor
+Large Red Retrospot Windmill (64.4%)
+Small Red Retrospot Windmill (40.6%)
+
+Pet/Animal Bowls
+Dog Bowl Chasing Ball Design (53.5%)
+Cat bowls (multiple, 40-72% concentrated)
+
+
+April-May spike is outdoor/garden season - customers buying for spring gardening, outdoor games, and picnicking. This is UK spring when people start spending time in gardens. Also includes Easter items.
+
+Aug-Dec Products (Christmas Dominance)
+Key Themes:
+
+Christmas Decorations
+Paper Chain Kit 50's Christmas (94.9%)
+Paper Chain Kit Vintage Christmas (96.7%)
+Rotating Silver Angels T-Light Holder (98.9%)
+Chilli Lights (62.2%)
+
+
+Gift Items
+Paper Craft Little Birdie (100% in this period!)
+Assorted Colour Bird Ornament (60.5%)
+
+Winter Warmth Products
+Chocolate Hot Water Bottle (86.2%)
+Scottie Dog Hot Water Bottle (87.0%)
+Hand Warmer Owl Design (99.2%)
+Red Woolly Hottie White Heart (82.1%)
+
+Holiday Lighting
+Rabbit Night Light (89.1%)
+Colour Glass Star T-Light Holder (66.4%)
+
+
+Aug-Dec is heavily Christmas-focused as expected, with decorations, lights, and gift items. Also includes cozy winter products (hot water bottles, hand warmers) for cold weather comfort.
+
+
+Inventory Planning:
+
+Jan-Feb: Stock up on Valentine's items (hearts, red colors) and Easter craft supplies
+Mar-Apr: Bring in garden sets, outdoor games, picnic items, windmills
+Jul-Aug: Massive Christmas inventory buildup - decorations, lights, hot water bottles
+
+Marketing Calendar:
+
+Feb: Valentine's Day campaigns (hearts, red spotty items)
+Mar: Easter crafts and spring home décor
+Apr-May: Garden season promotions (outdoor games, picnic supplies)
+Aug-Dec: Christmas dominates - shift to holiday gifting, decorations, cozy items
+
+# Final dataframes
+
+```{r}
+# df with negative values for quantity
+# returns_df
+
+# df with negative prices
+# zero_price_df
+
+# Final df with data cleaning, negative prices, and negative quantities removed
+# df
+
+# Code for removing M when doing product level analysis
+# df <- df |> 
+#  filter(!StockCode %in% c("M"))
+```
+
