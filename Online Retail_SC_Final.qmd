@@ -1,0 +1,1939 @@
+---
+title: "Case study 2"
+format: html
+editor: source
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(MASS)
+library(caret)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(car)
+library(sqldf)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(cluster)
+library(gridExtra)
+library(lattice)
+library(gam)
+library(tidyverse)  
+library(factoextra) 
+library(dendextend)
+library(ordinal)
+library(e1071)
+library(ROCR)
+library(purrr)
+library(tidytext)
+library(plotly)
+```
+
+# EDA
+
+```{r}
+df <- bind_rows(
+  read_excel("online_retail.xlsx", sheet = "Year 2009-2010"),
+  read_excel("online_retail.xlsx", sheet = "Year 2010-2011"))
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+str(df)
+```
+
+Categorical Variables: Invoice StockCode Description Country InvoiceDate
+
+Numerical Variables: Quantity Price Customer ID
+
+Thoughts: Maybe certain times are better to increase prices? Customers are less price sensitive during holidays etc. Also important to make sure not to run out of products.
+
+if you buy christmas lights do you also buy something else - market basket increase certain products during certain times
+
+```{r}
+# check for NA's
+# Description NA's... those products still matter but what are they
+colSums(is.na(df))
+```
+
+Customer ID is missing a ton of values, does that mean those aren't sales? the quantity still changes so there were sales that existed but for some reason there aren't Customer ID's, not sure what that indicates
+
+# Data Cleaning
+
+## Important: Stock code M will need to be removed when modeling stock
+
+M is manual override. For some reason, the product information was lost but the sales, quantity, and customer info was retained for that sale. Keeping M in for the meantime to accurately track sales and customer spending.
+
+df \<- df \|\> filter(!StockCode %in% c("M"))
+
+```{r}
+# Check for duplicates
+nrow(df)  # Total rows
+nrow(distinct(df))  # Unique rows
+```
+
+```{r}
+# Remove exact duplicate rows only
+df <- df |> 
+  distinct()
+nrow(df)
+```
+
+```{r}
+# trim spaces in character columns
+df <- df |> 
+  mutate(across(where(is.character), trimws))
+
+# Remove completely empty strings
+df <- df |> 
+  mutate(across(where(is.character), ~na_if(., "")))
+```
+
+```{r}
+# make a new column Revenue as the product of price and quantity
+df <- df |> 
+  mutate(Revenue = Price * Quantity)
+
+# convert InvoiceDate to Date format
+df$InvoiceDate <- as.Date(df$InvoiceDate)
+```
+
+```{r}
+head(df)
+```
+
+```{r}
+# Fill NAs in Description with the most common description for each StockCode
+df <- df |> 
+  group_by(StockCode) |> 
+  mutate(
+    Description = ifelse(is.na(Description), 
+                        first(Description[!is.na(Description)]), 
+                        Description)
+  ) |> 
+  ungroup()
+
+# check null results now
+df |> 
+  filter(is.na(Description)) |> 
+  nrow()
+colSums(is.na(df))
+```
+
+```{r}
+# See which StockCodes still have null descriptions
+null_by_stockcode <- df |> 
+  filter(is.na(Description)) |> 
+  group_by(StockCode) |> 
+  summarise(
+    Count = n(),
+    Sample_Invoice = first(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Count))
+
+print(null_by_stockcode)
+```
+
+```{r}
+# Remove POST and DOT, postage isn't a product they actually sell, they just charge for it
+
+df <- df |> 
+  filter(!StockCode %in% c("POST", "DOT"))
+
+# Verify they're gone
+df |> 
+  filter(StockCode %in% c("POST", "DOT")) |> 
+  nrow()  
+
+```
+
+```{r}
+# negative quantities I don't want to necessarily completely delete since they may be useful
+# Separate returns/adjustments from regular sales
+# df will be the sales df 
+returns_df <- df |> 
+  filter(Quantity < 0)
+
+positive_df <- df |> 
+  filter(Quantity > 0)
+
+```
+
+```{r}
+# View all rows with negative quantities
+
+# See how many there are
+nrow(returns_df)
+
+# View them
+head(returns_df)
+```
+
+```{r}
+# looks like for some of them it's the same customer doing the negative quantity
+returns_df |> 
+  dplyr::select(`Customer ID`, Invoice, StockCode, Description, Quantity, Price, Country, InvoiceDate)
+
+```
+
+```{r}
+# rows with 0 price, don't want to completely get rid of them in case we need them later
+# the 0 price rows also have some with no description, but they do have quantities
+# Save zero-price rows to separate dataset
+zero_price_df <- df |> 
+  filter(Price == 0)
+
+# Remove zero-price rows from df
+df <- df |> 
+  filter(Price > 0)
+
+# Verify
+cat("Zero price dataset:", nrow(zero_price_df), "rows\n")
+cat("Main dataset:", nrow(df), "rows\n")
+cat("Total:", nrow(zero_price_df) + nrow(df), "rows\n")
+```
+
+```{r}
+# View all rows with negative prices
+# Description says adjust bad debt, maybe some kind of charge back
+# They have a stock code of just B
+
+# See how many there are
+nrow(zero_price_df)
+
+# View them
+head(zero_price_df)
+```
+
+B = Bad debt
+
+```{r}
+# Remove B stock code
+df <- df |> 
+  filter(!StockCode %in% c("B"))
+```
+
+# More EDA
+
+```{r}
+# See the earliest and latest dates
+# Spans about a year
+range(df$InvoiceDate, na.rm = TRUE)
+```
+
+```{r}
+# Unique Products
+unique_products <- n_distinct(df$StockCode)
+cat("Unique Products:", unique_products, "\n")
+
+# Unique Customers
+unique_customers <- n_distinct(df$`Customer ID`, na.rm = TRUE)
+cat("Unique Customers:", unique_customers, "\n")
+
+# Unique Countries
+unique_countries <- n_distinct(df$Country)
+cat("Unique Countries:", unique_countries, "\n")
+
+# Unique Transactions
+unique_transactions <- n_distinct(df$Invoice)
+cat("Unique Transactions:", unique_transactions, "\n")
+```
+
+```{r}
+# Monthly, weekly transactions
+
+# Monthly transaction counts
+monthly_transactions <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_transactions)
+
+# Average per month
+cat("\nAverage Transactions per Month:", 
+    round(mean(monthly_transactions$Transactions), 1), "\n")
+
+# Weekly transaction counts
+weekly_transactions <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(head(weekly_transactions))
+
+# Average per week
+cat("Average Transactions per Week:", 
+    round(mean(weekly_transactions$Transactions), 1), "\n")
+```
+
+```{r}
+# Monthly weekly Revenue
+
+# Monthly revenue
+monthly_revenue <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(monthly_revenue)
+
+# Average per month
+cat("\nAverage Revenue per Month: £", 
+    format(round(mean(monthly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+
+# Weekly revenue
+weekly_revenue <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(head(weekly_revenue, 20))
+
+# Average per week
+cat("Average Revenue per Week: £", 
+    format(round(mean(weekly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+```
+
+# Which countries contribute the most to Sales growth?
+
+UK, Ireland, Netherlands, Germany, France
+
+```{r}
+# revenue by country
+# Most of the distribution is in the UK and the rest of Europe
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+```{r}
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>  # top 5
+  ggplot(aes(x = reorder(Country, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Countries by Total Revenue",
+       x = "Country",
+       y = "Total Revenue") +
+  theme_minimal()
+```
+```{r}
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>  # top 5
+  ggplot(aes(x = reorder(Country, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 5 Countries by Total Revenue",
+    x = "Country",
+    y = "Total Revenue"
+  ) +
+  scale_y_continuous(labels = comma) +  # ✅ display numbers normally
+  theme_minimal()
+```
+
+# What are the top-selling products?
+
+```{r}
+# top selling products
+# M is manual, you can't track what M is
+# 22423, 85123A, M
+df |> 
+  group_by(StockCode) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+```{r}
+df |> 
+  filter(!is.na(Description)) |>  # Remove rows with NA descriptions
+  group_by(StockCode) |> 
+  summarise(
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    Description = first(Description)  # Get first description for each StockCode
+  ) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>
+  ggplot(aes(x = reorder(Description, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Products by Total Revenue",
+       x = "Product Description",
+       y = "Total Revenue") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+```{r}
+# revenue grouped by customer
+# most of the revenue doesn't have a customer ID, who is buying all of this then
+# Highest buying customers, 18102, 14646
+df |> 
+  group_by(`Customer ID`) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+# Time Series
+
+```{r}
+# Create daily sales summary
+daily_sales <- df |> 
+  group_by(InvoiceDate) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(InvoiceDate)
+
+head(daily_sales)
+summary(daily_sales)
+```
+
+```{r}
+# Create monthly sales summary
+monthly_sales <- df |> 
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate),
+    YearMonth = floor_date(InvoiceDate, "month")  # First day of each month
+  ) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(YearMonth)
+
+# View monthly data
+print(monthly_sales)
+
+# Plot monthly sales
+ggplot(monthly_sales, aes(x = YearMonth, y = Num_Transactions)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 3) +
+  labs(title = "Monthly Sales Transactions",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot monthly revenue
+ggplot(monthly_sales, aes(x = YearMonth, y = Total_Revenue)) +
+  geom_line(color = "darkgreen", size = 1.2) +
+  geom_point(color = "darkgreen", size = 3) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Monthly Revenue",
+       x = "Month",
+       y = "Total Revenue (£)") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+
+# Normalize for dual axis
+monthly_sales <- monthly_sales |> 
+  mutate(
+    Revenue_Scaled = Total_Revenue / max(Total_Revenue) * max(Num_Transactions)
+  )
+
+ggplot(monthly_sales, aes(x = YearMonth)) +
+  # Revenue bars
+  geom_col(aes(y = Revenue_Scaled), fill = "lightgreen", alpha = 0.7) +
+  # Transaction line
+  geom_line(aes(y = Num_Transactions), color = "steelblue", size = 1.5) +
+  geom_point(aes(y = Num_Transactions), color = "steelblue", size = 3) +
+  labs(title = "Sales Transactions and Revenue Over Time",
+       subtitle = "Blue line: Transactions | Green bars: Revenue",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Product Sales
+
+```{r}
+
+# Identify top-selling products by quantity
+top_products <- df |> 
+  group_by(StockCode, Description) |> 
+  summarise(
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  filter(!is.na(Description), Total_Quantity_Sold > 0) |> 
+  arrange(desc(Total_Quantity_Sold)) |> 
+  head(10)
+
+print(top_products)
+
+# Select top 3-5 products for forecasting
+key_stockcodes <- top_products$StockCode[1:5]
+```
+
+```{r}
+# Monthly demand for top products
+monthly_demand <- df |> 
+  filter(StockCode %in% top_products$StockCode) |> 
+  mutate(Month = floor_date(InvoiceDate, "month")) |> 
+  group_by(StockCode, Description, Month) |> 
+  summarise(
+    Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_demand)
+```
+
+```{r}
+# Show the clear Christmas spike
+ggplot(monthly_demand, aes(x = Month, y = Quantity_Sold, color = Description)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  labs(title = "Monthly Demand for Top 5 Products",
+       subtitle = "Clear seasonal spike before Christmas",
+       x = "Month",
+       y = "Quantity Sold") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Seasonal buying patterns
+
+Percentage shows what proportion of that product's total annual revenue came from that specific season.
+
+```{r}
+# extract month from InvoiceDate
+df <- df |> 
+  mutate(
+    Month = month(InvoiceDate, label = TRUE),
+    Month_Num = month(InvoiceDate),
+    Year = year(InvoiceDate)
+  )
+
+# Define the seasonal periods you want to analyze
+seasonal_analysis <- df |> 
+  mutate(
+    Season_Period = case_when(
+      Month_Num %in% c(2, 3) ~ "Feb-Mar Spike",
+      Month_Num %in% c(4, 5) ~ "Apr-May Spike",
+      Month_Num %in% c(8, 9, 10, 11, 12) ~ "Aug-Dec (Holiday Season)",
+      TRUE ~ "Other Months"
+    )
+  )
+
+# Top products by season
+top_products_by_season <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  group_by(Season_Period, Description) |> 
+  summarise(
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    Avg_Price = mean(Price, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 20) |>  # Top 20 products per season
+  ungroup()
+
+print(top_products_by_season)
+
+# Compare revenue by season period
+season_revenue_summary <- seasonal_analysis |> 
+  group_by(Season_Period) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Orders = n_distinct(Invoice),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Unique_Products = n_distinct(StockCode),
+    Avg_Order_Value = Total_Revenue / Total_Orders,
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Total_Revenue))
+
+print(season_revenue_summary)
+
+# Look for products that are UNIQUE to spike periods
+# (appear heavily in spike months but not in other months)
+spike_specific_products <- seasonal_analysis |> 
+  group_by(Description, Season_Period) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    Quantity = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  pivot_wider(
+    names_from = Season_Period,
+    values_from = c(Revenue, Quantity),
+    values_fill = 0
+  ) |> 
+  # Calculate what % of product's revenue comes from each season
+  mutate(
+    Total_Revenue = `Revenue_Feb-Mar Spike` + `Revenue_Apr-May Spike` + 
+                    `Revenue_Aug-Dec (Holiday Season)` + `Revenue_Other Months`,
+    FebMar_Pct = round(`Revenue_Feb-Mar Spike` / Total_Revenue * 100, 1),
+    AprMay_Pct = round(`Revenue_Apr-May Spike` / Total_Revenue * 100, 1),
+    AugDec_Pct = round(`Revenue_Aug-Dec (Holiday Season)` / Total_Revenue * 100, 1)
+  ) |> 
+  filter(Total_Revenue > 1000) |>  # Only products with meaningful revenue
+  arrange(desc(FebMar_Pct))
+
+# Products heavily concentrated in Feb-Mar
+febmar_products <- spike_specific_products |> 
+  filter(FebMar_Pct >= 40) |>  # 40%+ of revenue in Feb-Mar
+  dplyr::select(Description, FebMar_Pct, `Revenue_Feb-Mar Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Feb-Mar Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN FEB-MAR ===")
+print(head(febmar_products, 15))
+
+# Products heavily concentrated in Apr-May
+aprmay_products <- spike_specific_products |> 
+  filter(AprMay_Pct >= 40) |>
+  dplyr::select(Description, AprMay_Pct, `Revenue_Apr-May Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Apr-May Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN APR-MAY ===")
+print(head(aprmay_products, 15))
+
+# Products heavily concentrated in Aug-Dec
+augdec_products <- spike_specific_products |> 
+  filter(AugDec_Pct >= 60) |>  # Higher threshold since this is longer period
+  dplyr::select(Description, AugDec_Pct, `Revenue_Aug-Dec (Holiday Season)`, Total_Revenue) |>
+  arrange(desc(`Revenue_Aug-Dec (Holiday Season)`))
+
+print("=== PRODUCTS CONCENTRATED IN AUG-DEC ===")
+print(head(augdec_products, 15))
+
+# Look at product keywords/themes
+# Extract common words from product descriptions in each season
+library(tidytext)
+
+season_keywords <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  dplyr::select(Season_Period, Description, Revenue) |> 
+  unnest_tokens(word, Description) |> 
+  anti_join(stop_words, by = "word") |>  # Remove common words like "the", "and"
+  filter(!word %in% c("set", "pack", "vintage", "red", "white", "blue", "pink")) |>  # Remove generic words
+  group_by(Season_Period, word) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Count = n(),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 15)
+
+print("=== TOP KEYWORDS BY SEASON ===")
+print(season_keywords)
+```
+
+# Results
+
+Overall Revenue Distribution:
+
+Aug-Dec (Holiday Season): \$9.1M (53%) - Dominates as expected Apr-May Spike: \$2.3M (13%) Feb-Mar Spike: \$2.2M (13%) Other Months: \$3.6M (21%)
+
+Feb-Mar Spike Products -Valentine's & Early Spring
+
+Key Themes: Red & Hearts - Valentine's Day focus Door Mat Hearts (52.4% of sales in Feb-Mar) Pack of 12 Red Spotty Tissues (51.7%) Jumbo Bag Red White Spotty (42.3%)
+
+Home Decor - Spotty/Polka Dot Pattern Door mats with spots (multiple variations 40-60% concentrated) Retro Spot Cake Stand (41.3%) These appear to be spring/fresh design themes
+
+Easter Prep Beginning Easter Craft 4 Chicks (66.9%) Small Fairy Cake Fridge Magnets (94.2%) - likely spring/Easter themed
+
+Insight: February-March spike is driven by Valentine's Day (hearts, red colors) and early Easter/spring preparation (craft items, fresh spotty patterns). This is when customers start planning for spring entertaining and Easter celebrations.
+
+Apr-May Spike Products (Easter, Gardening, Outdoor Season) Key Themes:
+
+Outdoor/Garden Products - Spring gardening season Wooden Rounders Garden Set (48.9% - \$10,263!) Wooden Croquet Garden Set (40.9%) Wooden Skittles Garden Set (51.9%) Gardeners Kneeling Pad (45.7%) Watering Can Green Dinosaur (43.1%)
+
+Picnic/Outdoor Dining Picnic Basket Wicker Large (42.3%) Set of 4 New England Placemats (91.5%)
+
+Outdoor Décor Large Red Retrospot Windmill (64.4%) Small Red Retrospot Windmill (40.6%)
+
+Pet/Animal Bowls Dog Bowl Chasing Ball Design (53.5%) Cat bowls (multiple, 40-72% concentrated)
+
+Insight: April-May spike is outdoor/garden season - customers buying for spring gardening, outdoor games, and al fresco dining. This is UK spring when people start spending time in gardens. Also includes Easter entertaining items.
+
+Aug-Dec Products (Christmas Dominance) Key Themes:
+
+Christmas Decorations Paper Chain Kit 50's Christmas (94.9%) Paper Chain Kit Vintage Christmas (96.7%) Rotating Silver Angels T-Light Holder (98.9%) Chilli Lights (62.2%)
+
+Gift Items Paper Craft Little Birdie (100% in this period!) Assorted Colour Bird Ornament (60.5%)
+
+Winter Warmth Products Chocolate Hot Water Bottle (86.2%) Scottie Dog Hot Water Bottle (87.0%) Hand Warmer Owl Design (99.2%) Red Woolly Hottie White Heart (82.1%)
+
+Holiday Lighting Rabbit Night Light (89.1%) Colour Glass Star T-Light Holder (66.4%)
+
+Insight: Aug-Dec is heavily Christmas-focused as expected, with decorations, lights, and gift items. Also includes cozy winter products (hot water bottles, hand warmers) for cold weather comfort.
+
+Inventory Planning:
+
+Jan-Feb: Stock up on Valentine's items (hearts, red colors) and Easter craft supplies Mar-Apr: Bring in garden sets, outdoor games, picnic items, windmills Jul-Aug: Massive Christmas inventory buildup - decorations, lights, hot water bottles
+
+Marketing Calendar:
+
+Feb: Valentine's Day campaigns (hearts, red spotty items) Mar: Easter crafts and spring home décor Apr-May: Garden season promotions (outdoor games, picnic supplies) Aug-Dec: Christmas dominates - shift to holiday gifting, decorations, cozy items
+
+# RFM Customer Segmentation
+
+## Important: rows with Customer ID need to be removed since we can't identify those
+
+```{r}
+# Save null customer ID rows to separate dataset
+null_customer_df <- df |> 
+  filter(is.na(`Customer ID`))
+
+# Remove from main dataset
+df <- df |> 
+  filter(!is.na(`Customer ID`))
+
+# Summary
+cat("Null customer rows:", nrow(null_customer_df), "\n")
+cat("Main dataset:", nrow(df), "\n")
+```
+
+```{r}
+
+# Define analysis date - day after the last transaction)
+analysis_date <- max(df$InvoiceDate, na.rm = TRUE) + 1
+
+# Create RFM dataset
+rfm_data <- df |> 
+  filter(!is.na(`Customer ID`)) |> # remove rows without Customer ID since we can't identify those customers
+  group_by(`Customer ID`) |> 
+  summarise(
+    
+    # Recency- Days since last purchase
+    Recency = as.numeric(analysis_date - max(InvoiceDate, na.rm = TRUE)),
+    
+    # Frequency- Number of unique invoices/purchases
+    Frequency = n_distinct(Invoice),
+    
+    # Monetary- Total revenue
+    Monetary = sum(Revenue, na.rm = TRUE),
+    
+    .groups = 'drop'
+  ) |> 
+  filter(Monetary > 0)  # remove customers with negative or zero monetary value
+
+head(rfm_data)
+summary(rfm_data)
+```
+
+## Analyze the distributions
+
+There are some outliers, Recency is skewed to the right, Frequency is only slightly right skewed, monetary is really just at 0
+
+```{r}
+
+
+# histograms for each RFM component
+p1 <- ggplot(rfm_data, aes(x = Recency)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Recency Distribution", x = "Days Since Last Purchase")
+
+p2 <- ggplot(rfm_data, aes(x = Frequency)) +
+  geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.7) +
+  labs(title = "Frequency Distribution", x = "Number of Purchases")
+
+p3 <- ggplot(rfm_data, aes(x = Monetary)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.7) +
+  labs(title = "Monetary Distribution", x = "Total Revenue") +
+  scale_x_continuous(labels = scales::comma)
+
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+## Standardize the data for clustering
+
+```{r}
+# create dataset for clustering
+rfm_for_clustering <- rfm_data |> 
+  dplyr::select(Recency, Frequency, Monetary) |> 
+  mutate(
+    # Log transform Monetary to handle skew
+    Monetary_log = log1p(Monetary),
+    # Log transform Frequency for skew
+    Frequency_log = log1p(Frequency),
+    # Log transform Recency
+    Recency_log = log1p(Recency)
+  ) |> 
+  dplyr::select(Recency_log, Frequency_log, Monetary_log) |> 
+  scale() |>   # Standardize variables
+  as.data.frame()
+
+# Add Customer ID back
+rfm_for_clustering$CustomerID <- rfm_data$`Customer ID`
+```
+
+## Determine optimal number of clusters
+
+3 seems to be the most optimal
+
+```{r}
+
+# Prepare data for clustering (remove CustomerID)
+cluster_data <- rfm_for_clustering |> dplyr::select(-CustomerID)
+
+# Calculate within-cluster sum of squares for different k values
+wss <- numeric(10)
+
+for (k in 1:10) {
+  kmeans_temp <- kmeans(cluster_data, centers = k, nstart = 25)
+  wss[k] <- kmeans_temp$tot.withinss
+}
+
+# Plot the elbow curve
+plot(1:10, wss, type = "b", 
+     xlab = "Number of Clusters (k)", 
+     ylab = "Within-Cluster Sum of Squares",
+     main = "Elbow Method for Optimal k",
+     pch = 19, col = "blue")
+grid()
+
+
+# Silhouette method
+silhouette_scores <- numeric(9)
+
+for (k in 2:10) {
+  kmeans_temp <- kmeans(cluster_data, centers = k, nstart = 25)
+  sil <- silhouette(kmeans_temp$cluster, dist(cluster_data))
+  silhouette_scores[k-1] <- mean(sil[, 3])
+}
+
+# Plot silhouette scores
+plot(2:10, silhouette_scores, type = "b",
+     xlab = "Number of Clusters (k)",
+     ylab = "Average Silhouette Score",
+     main = "Silhouette Method for Optimal k",
+     pch = 19, col = "darkgreen")
+grid()
+```
+
+# K means clustering
+
+```{r}
+set.seed(123)  
+k_optimal <- 3
+
+kmeans_result <- kmeans(cluster_data, centers = k_optimal, nstart = 25)
+
+# Add cluster assignments back to original data
+rfm_data$Cluster <- as.factor(kmeans_result$cluster)
+```
+
+# Customer segments
+
+Wholesale: Avg_Monetary ≥ 8,000 (captures high-spending customers) High-Value: Avg_Recency \< 200 AND Avg_Monetary ≥ 1,000 (recent, moderate spenders) Casual: Everything else (inactive/low-value customers)
+
+Monetary is strongest differentiator, recency was second factor
+
+Cluster 1 (Wholesale): 1,251 customers, Freq 18.9, Monetary \$10,468
+
+Cluster 2 (Casual): 2,359 customers, Freq 1.5, Monetary \$393
+
+Cluster 3 (High-Value): 2,267 customers, Freq 4.2, Monetary \$1,418
+
+Revenue distribution Wholesale: 76.0% of revenue High-Value: 18.6% of revenue Casual: 5.4% of revenue
+
+```{r}
+# analyze and interpret
+# Summarize clusters
+# Step 6: Analyze and Interpret Clusters (Updated with Wholesale naming)
+
+# Summarize clusters
+cluster_summary <- rfm_data |> 
+  group_by(Cluster) |> 
+  summarise(
+    Count = n(),
+    Avg_Recency = round(mean(Recency), 1),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    .groups = 'drop'
+  ) |> 
+  arrange(Cluster)
+
+print(cluster_summary)
+
+cluster_summary <- cluster_summary |> 
+  mutate(
+    Segment = case_when(
+      # Wholesale - High monetary value (even with moderate frequency)
+      Avg_Monetary >= 8000 ~ "Wholesale",
+      
+      # High-Value - Recent and decent monetary
+      Avg_Recency < 200 & Avg_Monetary >= 1000 ~ "High-Value",
+      
+      # Casual - Everything else
+      TRUE ~ "Casual"
+    )
+  )
+
+print(cluster_summary)
+
+# revenue contribution by segment
+segment_analysis <- cluster_summary |> 
+  mutate(
+    Total_Revenue = Count * Avg_Monetary,
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1),
+    Customer_Percent = round(Count / sum(Count) * 100, 1)
+  ) |> 
+  dplyr::select(Segment, Cluster, Count, Customer_Percent, Avg_Monetary, Total_Revenue, Revenue_Percent)
+
+print(segment_analysis)
+```
+
+## Visualize segments
+
+Casual and high value seem to have a bit of overlap due to their monetary values being more similar and frequency is not that far apart
+
+```{r}
+library(plotly)
+
+# 3D scatter plot
+plot_ly(rfm_data, 
+        x = ~Recency, y = ~Frequency, z = ~Monetary,
+        color = ~Cluster,
+        type = "scatter3d",
+        mode = "markers") |> 
+  layout(title = "Customer Segments in RFM Space")
+
+# 2D plots
+p1 <- ggplot(rfm_data, aes(x = Recency, y = Monetary, color = Cluster)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Recency vs Monetary by Cluster") +
+  scale_y_continuous(labels = scales::comma)
+
+p2 <- ggplot(rfm_data, aes(x = Frequency, y = Monetary, color = Cluster)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Frequency vs Monetary by Cluster") +
+  scale_y_continuous(labels = scales::comma)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+# Top revenue generating customers
+
+Top 10 customers are 16% of total revenue (2.7M out of 17.2M) Top 20% of customers are 77.3% of total revenue (13.3M out of 17.2M) Business is heavily dependent on small group of customers, losing a few of them could greatly negatively impact the business Customer retention is critical, need risk management strategies to protect against losing key customers Growth opportunity for getting more sales from mid-tier customers since this 80% of customers only contribute to 24% of the revenue
+
+```{r}
+# Find top revenue-generating customers
+top_customers <- rfm_data |> 
+  arrange(desc(Monetary)) |> 
+  head(20) |>   # Top 20 
+  dplyr::select(`Customer ID`, Recency, Frequency, Monetary, Cluster)
+print(top_customers)
+
+# Calculate what % of revenue they represent
+top_10_revenue <- rfm_data |> 
+  arrange(desc(Monetary)) |> 
+  head(10) |> 
+  summarise(
+    Top10_Revenue = sum(Monetary),
+    Total_Revenue = sum(rfm_data$Monetary),
+    Percentage = round(Top10_Revenue / Total_Revenue * 100, 1)
+  )
+print(top_10_revenue)
+
+# Top 20%
+revenue_distribution <- rfm_data |> 
+  summarise(
+    Total_Customers = n(),
+    Total_Revenue = sum(Monetary),
+    Top_20pct_Revenue = sum(Monetary[Monetary >= quantile(Monetary, 0.8)]),
+    Top_20pct_Percentage = round(Top_20pct_Revenue / Total_Revenue * 100, 1)
+  )
+print(revenue_distribution)
+```
+
+# Churn Analysis
+
+Recency is the main churn indicator
+
+Cluster 1: Recency = 34 days, they're highly engaged and active Cluster 3: Recency = 107 days, moderate engagement
+
+Churn risk groups Active: 0-180 days (within 6 months - reasonable for seasonal) At Risk: 181-365 days (haven't purchased in last holiday season) High Risk: 366-545 days (missed multiple seasons) Churned: 545+ days (18 months - likely gone for good)
+
+Example: Someone who bought garden items in May and hasn't returned by September (120 days) isn't churned - they're just not in garden season. Same thing could be said for other holidays or seasons
+
+```{r}
+# For seasonal/Christmas retail, customers naturally have longer purchase cycles
+# Need to account for the seasonal nature of the business
+
+churn_analysis <- rfm_data |> 
+  mutate(
+    Churn_Risk = case_when(
+      Recency <= 180 ~ "Active",          # Purchased within 6 months
+      Recency <= 365 ~ "At Risk",         # 6-12 months (missed last season)
+      Recency <= 545 ~ "High Risk",       # 12-18 months (missed 1-2 seasons)
+      TRUE ~ "Churned"                     # 18+ months (likely gone)
+    ),
+    # Convert to factor for proper ordering
+    Churn_Risk = factor(Churn_Risk, 
+                        levels = c("Active", "At Risk", "High Risk", "Churned"))
+  )
+
+# Summary of churn risk distribution
+churn_summary <- churn_analysis |> 
+  group_by(Churn_Risk) |> 
+  summarise(
+    Customer_Count = n(),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    Total_Revenue = round(sum(Monetary), 0),
+    .groups = 'drop'
+  ) |> 
+  mutate(
+    Customer_Percent = round(Customer_Count / sum(Customer_Count) * 100, 1),
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(churn_summary)
+
+# Identify high-value customers at risk
+high_value_at_risk <- churn_analysis |> 
+  filter(Churn_Risk %in% c("At Risk", "High Risk", "Churned")) |> 
+  filter(Monetary >= 1000 | Frequency >= 3) |>  # Lowered frequency threshold for seasonal
+  arrange(desc(Monetary)) |> 
+  select(`Customer ID`, Recency, Frequency, Monetary, Churn_Risk, Cluster)
+
+print(head(high_value_at_risk, 20))
+
+# Count of high-value at-risk customers
+high_value_at_risk_summary <- high_value_at_risk |> 
+  group_by(Churn_Risk) |> 
+  summarise(
+    Count = n(),
+    Total_At_Risk_Revenue = sum(Monetary),
+    Avg_Monetary = round(mean(Monetary), 0)
+  )
+
+print(high_value_at_risk_summary)
+```
+
+## Results
+
+Overall Churn Distribution
+
+Active - 59.2% of customers are Active (3,477 customers) - These active customers drive 86.5% of total revenue (\$14.9M) - Average value: \$4,290 per active customer
+
+40.8% Show Churn Risk - 787 At Risk + 1,062 High Risk + 551 Churned = 2,400 customers at risk - Collectively represent 13.4% of revenue (\$2.3M at stake)
+
+At Risk (787 customers - 13.4%) - Gone 6-12 months (181-365 days) - Average value: \$1,323 - Total potential revenue: \$1.04M (6.0%) - Prime targets for win-back campaigns, they're still reachable
+
+High Risk (1,062 customers - 18.1%) - Gone 12-18 months (366-545 days) - Average value: \$876 - Total potential revenue: \$930K (5.4%) - Harder to recover but still worth trying
+
+Churned (551 customers - 9.4%) - Gone 18+ months (545+ days) - Average value: \$640 - Total potential revenue: \$353K (2.0%) - Mostly lost, minimal investment warranted
+
+High-Value At-Risk Customers - 572 previously valuable customers need immediate attention
+
+At Risk Segment (407 customers): - Total historical value: \$913K - Average value: \$2,244 per customer - These aren't small buyers - they're customers who used to spend significantly
+
+At risk by customer: Customer 12346: \$277K historical value, gone 326 days Customer 16754: \$65K historical value, gone 373 days Customer 13093: \$54K historical value, gone 276 days Customer 17850: \$155K historical value, gone 372 days
+
+Don't Chase: Churned (551 customers, \$353K) - Been gone 18+ months - ROI likely negative except for very high-value accounts
+
+## Sensitivity analysis
+
+```{r}
+# Test different threshold scenarios
+sensitivity_scenarios <- list(
+  "Conservative" = c(150, 300, 450),   # Stricter - faster to label as at-risk
+  "Current" = c(180, 365, 545),        # Current thresholds
+  "Lenient" = c(210, 400, 600)         # More forgiving - slower to label churned
+)
+
+# Function to calculate churn distribution for given thresholds
+calculate_churn <- function(thresholds, data) {
+  data |> 
+    mutate(
+      Churn_Risk = case_when(
+        Recency <= thresholds[1] ~ "Active",
+        Recency <= thresholds[2] ~ "At Risk",
+        Recency <= thresholds[3] ~ "High Risk",
+        TRUE ~ "Churned"
+      )
+    ) |> 
+    group_by(Churn_Risk) |> 
+    summarise(
+      Count = n(),
+      Percent = round(n() / nrow(data) * 100, 1),
+      Avg_Monetary = round(mean(Monetary), 0),
+      .groups = 'drop'
+    )
+}
+
+# Run sensitivity analysis
+sensitivity_results <- map_dfr(
+  names(sensitivity_scenarios),
+  function(scenario_name) {
+    thresholds <- sensitivity_scenarios[[scenario_name]]
+    calculate_churn(thresholds, rfm_data) |> 
+      mutate(Scenario = scenario_name, .before = 1)
+  }
+)
+
+print(sensitivity_results)
+
+# Compare key metrics across scenarios
+scenario_comparison <- sensitivity_results |> 
+  group_by(Scenario) |> 
+  summarise(
+    Active_Pct = Percent[Churn_Risk == "Active"],
+    AtRisk_Pct = Percent[Churn_Risk == "At Risk"],
+    AtRisk_Revenue = Avg_Monetary[Churn_Risk == "At Risk"],
+    Total_AtRisk_HighRisk = sum(Count[Churn_Risk %in% c("At Risk", "High Risk")]),
+    .groups = 'drop'
+  )
+
+print(scenario_comparison)
+```
+
+Active Customer %:
+
+Conservative: 56.1% Current: 59.2% Lenient: 61.8% Range: Only 5.7 percentage points
+
+At Risk Customer %:
+
+Conservative: 13.2% Current: 13.4% Lenient: 16.7% Relatively stable, though lenient definition captures more
+
+Total At Risk + High Risk Customers:
+
+Conservative: 1,701 customers Current: 1,849 customers Lenient: 1,882 customers Range: Only 181 customers difference (10.6% variation)
+
+At Risk Average Revenue:
+
+All scenarios show \$1,225-\$1,323 range Very consistent - the same type of customers fall into "At Risk" regardless of thresholds
+
+## Churn Risk table
+
+```{r}
+# How does churn risk vary by customer segment?
+churn_by_segment <- rfm_data |>
+  select(`Customer ID`, Cluster) |>
+  left_join(churn_analysis |> select(`Customer ID`, Churn_Risk), by = "Customer ID") |>
+  group_by(Cluster, Churn_Risk) |>
+  summarise(Count = n(), .groups = 'drop') |>
+  group_by(Cluster) |>
+  mutate(Percent = round(Count / sum(Count) * 100, 1)) |>
+  arrange(Cluster, Churn_Risk)
+
+print(churn_by_segment)
+```
+
+# Promotion
+
+Targeting Priorities Critical - VIP Priority: 39 At-Risk Wholesale Customers (Cluster 1)
+
+Personal outreach required - phone calls or in-person meetings, not emails Premium offers - 25%+ discounts, VIP treatment, exclusive early access White-glove service - assign dedicated account managers These 39 customers represent \~\$616K in historical value (\$15,787 average) Why critical: In a segment with 97% retention, these are exceptional cases with average 20.5 purchases - clear relationship failures requiring immediate executive intervention
+
+High Priority: 858 customers (mostly Cluster 3 High-Value)
+
+Targeted email campaigns with personalized product recommendations Strong offers - 15-20% discounts plus free shipping Early season access to new holiday collections Total potential value: \$1.05M (\$1,227 average per customer) Goal: Re-engage proven loyal customers (20.3 avg purchases) who've been inactive \~3 months
+
+Medium Priority: 1,369 customers
+
+Standard seasonal email campaigns with product highlights Moderate offers - 10% discount codes Total potential value: \$343K (\$250 average per customer) Goal: Cost-effective reactivation of moderate-value customers
+
+Low Priority: 1,645 customers
+
+Generic email blasts only - minimal personalization Basic offers - 5-10% discounts Total potential value: \$184K (\$112 average per customer)
+
+Do NOT Target: 1,966 customers (33.5%)
+
+Save the budget - one-time buyers who never engaged (1.6 avg purchases) Total potential value: \$81K but cost to reactivate exceeds likely return Better to invest in customer acquisition than chasing customers who never engaged
+
+Logic Behind the Strategy We're identifying customers who are:
+
+Reachable - not too active already (don't need incentive), not completely lost (beyond recovery) Valuable - worth the promotional investment based on historical spend Likely to respond - demonstrated loyalty/engagement through repeat purchases
+
+The Scoring System Core RFM Weights:
+
+Recency (50% weight): Primary identifier of who needs intervention now Frequency (30% weight): Past loyalty predicts future response - customers with 5+ purchases respond better Monetary (20% weight): Indicates value to justify promotional cost
+
+Cluster Bonus Enhancement:
+
++3 points for Wholesale (Cluster 1): Highest priority segment +1 point for High-Value (Cluster 3): Moderate boost +0 points for Casual (Cluster 2): No boost - limited engagement history
+
+Why the Cluster Bonus Matters After discovering that 97% of Wholesale customers maintain active status, we recognized that any Wholesale customer showing churn risk represents a critical exception requiring immediate attention. These aren't normal churn cases - they're relationship failures in an otherwise highly loyal segment, suggesting:
+
+Service issues that can be resolved Competitive threats that need addressing Business changes we need to understand Opportunity to demonstrate we value the relationship before it's too late
+
+At \$15,787 average value and 20.5 purchase history, each represents a significant relationship worth salvaging.
+
+```{r}
+promotion_targeting <- rfm_data |> 
+  # Add churn risk to rfm_data
+  mutate(
+    Churn_Risk = case_when(
+      Recency <= 180 ~ "Active",
+      Recency <= 365 ~ "At Risk",
+      Recency <= 545 ~ "High Risk",
+      TRUE ~ "Churned"
+    ),
+    Churn_Risk = factor(Churn_Risk, 
+                        levels = c("Active", "At Risk", "High Risk", "Churned"))
+  ) |>
+  mutate(
+    # Score components
+    Recency_Score = case_when(
+      Recency <= 90 ~ 2,
+      Recency <= 180 ~ 8,
+      Recency <= 365 ~ 10,
+      Recency <= 545 ~ 6,
+      TRUE ~ 2
+    ),
+    
+    Frequency_Score = case_when(
+      Frequency >= 10 ~ 10,
+      Frequency >= 5 ~ 8,
+      Frequency >= 2 ~ 6,
+      TRUE ~ 3
+    ),
+    
+    Monetary_Score = case_when(
+      Monetary >= 5000 ~ 10,
+      Monetary >= 2000 ~ 8,
+      Monetary >= 1000 ~ 6,
+      Monetary >= 500 ~ 4,
+      TRUE ~ 2
+    ),
+    
+    # Cluster bonus
+    Cluster_Bonus = case_when(
+      Cluster == "1" ~ 3,
+      Cluster == "3" ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Promotion score
+    Promotion_Score = round(
+      (Recency_Score * 0.5 + Frequency_Score * 0.3 + Monetary_Score * 0.2) + Cluster_Bonus, 1
+    ),
+    
+    # Priority
+    Promotion_Priority = case_when(
+      Cluster == "1" & Churn_Risk %in% c("At Risk", "High Risk", "Churned") ~ "Critical - VIP",
+      Promotion_Score >= 9 ~ "High Priority",
+      Promotion_Score >= 7 ~ "Medium Priority",
+      Promotion_Score >= 5 ~ "Low Priority",
+      TRUE ~ "Do Not Target"
+    ),
+    
+    Promotion_Priority = factor(Promotion_Priority,
+                                levels = c("Critical - VIP", "High Priority", 
+                                          "Medium Priority", "Low Priority", "Do Not Target"))
+  )
+
+
+promotion_summary <- promotion_targeting |> 
+  group_by(Promotion_Priority) |> 
+  summarise(
+    Customer_Count = n(),
+    Avg_Promotion_Score = round(mean(Promotion_Score), 1),
+    Avg_Recency = round(mean(Recency), 0),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    Total_Potential_Revenue = sum(Monetary),
+    .groups = 'drop'
+  ) |> 
+  mutate(
+    Customer_Percent = round(Customer_Count / sum(Customer_Count) * 100, 1),
+    Revenue_Percent = round(Total_Potential_Revenue / sum(Total_Potential_Revenue) * 100, 1)
+  )
+
+print(promotion_summary)
+
+```
+
+## Results
+
+The Promotion Response Prediction Model Most Likely to Respond (Highest Scores):
+
+Recency: 180-365 days (need nudge to return - perfect reactivation window) Frequency: 5+ purchases (proven loyalty to brand) Monetary: \$1,000+ (valuable enough to justify promotional investment) Segment: Wholesale or High-Value customers (demonstrated commitment)
+
+Least Likely to Respond (Lowest Scores):
+
+Recency: \<90 days (already active, don't need incentive) OR \>545 days (too far gone) Frequency: 1-2 purchases (never truly engaged with brand) Monetary: \<\$500 (low value, questionable ROI) Segment: Casual customers (minimal relationship to salvage)
+
+The Prediction Results We identified 897 customers (15.3%) who are MOST LIKELY to respond: Critical - VIP (39 customers - 0.7%):
+
+Prediction: Extremely high response probability (score 11.9) Profile: Previously super loyal (20.5 purchases, \$15,787 average value) but now inactive for 10+ months Why they'll respond: Deep purchase history shows they know and trust the brand - they just need compelling reason to re-engage Revenue potential: \$616K
+
+High Priority (858 customers - 14.6%):
+
+Prediction: High response probability (score 9.3) Profile: Strong history (20.3 purchases, \$1,227 value), recently gone inactive (\~3 months) Why they'll respond: Still within reachable window; recent enough that brand remains top-of-mind Revenue potential: \$1.05M
+
+Combined top tiers: 897 customers averaging \$1,857 in lifetime value
+
+We identified 1,966 customers (33.5%) who are LEAST LIKELY to respond:
+
+One-time buyers (1.6 purchases average) - never truly engaged Long gone (297 days recency) - formed new shopping habits Low value (\$41 average) - cost to reactivate exceeds return Basically already churned - promotional offers unlikely to generate positive ROI
+
+ROI Projections Conservative Scenario (20% conversion on top tiers):
+
+VIPs: 8 customers × \$15,787 = \$126K High Priority: 172 customers × \$1,227 = \$211K Total recovered revenue: \~\$337K
+
+Moderate Scenario (30% VIP, 25% High Priority):
+
+VIPs: 12 customers × \$15,787 = \$189K High Priority: 215 customers × \$1,227 = \$264K Total recovered revenue: \~\$453K
+
+How to Implement These Predictions Budget Allocation:
+
+50% → Critical VIP tier (39 customers) - highest ROI, personal intervention 35% → High Priority tier (858 customers) - automated but targeted 10% → Medium Priority tier (1,369 customers) - standard seasonal 5% → Low Priority tier (1,645 customers) - minimal effort 0% → Do Not Target (1,966 customers) - redirect budget to acquisition
+
+Timeline:
+
+Immediate (0-30 days): Personal outreach to 39 VIP customers Pre-season (30-60 days): Launch High Priority email campaigns Seasonal (60-90 days): Standard Medium/Low priority campaigns
+
+## Preping Data for prediction models
+
+```{r}
+str(df)
+```
+
+Adjusting variables to create new variables for my analysis and setting Country varible to be a factor
+
+```{r}
+df$InvoiceDate = as.POSIXct(df$InvoiceDate)
+df$Country = as.factor(df$Country)
+df$Date = as.Date(df$InvoiceDate)
+df$TotalPrice = df$Quantity*df$Price
+df = df %>%  mutate(
+    OrderCancelled = ifelse(grepl("^C", Invoice), 1, 0),
+  )
+```
+
+```{r}
+str(df)
+```
+
+```{r}
+observation_date = max(df$Date, na.rm = TRUE)
+
+customer_activity = df %>%
+  filter(!is.na(`Customer ID`)) %>%
+  group_by(`Customer ID`) %>%
+  summarise(
+    DaysSinceLastPurchase = as.numeric(difftime(observation_date, max(Date), units = "days")),
+    NumTransactions = n_distinct(Invoice),
+    TotalRevenue = sum(TotalPrice, na.rm = TRUE),
+    AvgOrderValue = TotalRevenue / n_distinct(Invoice),
+    TotalQuantity = sum(Quantity, na.rm = TRUE),
+    Country = first(Country),
+     NumCancelled = sum(OrderCancelled),
+    CustomerLifetime = as.numeric(difftime(max(Date), min(Date), units = "days"))
+  ) %>%
+  ungroup()
+
+customer_activity = customer_activity %>%
+  mutate(Churned = as.factor(ifelse(DaysSinceLastPurchase > 365, 1, 0)))
+```
+
+Added DaysSinceLastPurchase variable in order to quantify the Churn variable, but will remove this from modeling dataset.
+
+```{r}
+customer_data = customer_activity %>% 
+  dplyr::select(-`Customer ID`, -DaysSinceLastPurchase)
+```
+
+```{r}
+str(customer_data)
+```
+
+```{r}
+churn_summary <- customer_data %>%
+  count(Churned) %>%
+  mutate(Percent = n / sum(n) * 100)
+
+ggplot(churn_summary, aes(x = Churned, y = n, fill = Churned)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = paste0(round(Percent, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("#2E8B57", "#E74C3C")) +
+  labs(title = "Customer Churn Distribution",
+       x = "Customer Status",
+       y = "Number of Customers",
+       fill = "Status") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Churned customers represent 27.5% of the modeling dataset. To address this class imbalance, I will adjust the classification threshold to better account for the unequal distribution between churned and loyal customers.
+
+##Splitting Dataset
+
+```{r}
+set.seed(369)
+tr_ind = sample(nrow(customer_data), .7*nrow(customer_data), replace = FALSE)
+cdtrain = customer_data[tr_ind,]
+cdtest = customer_data[-tr_ind,]
+```
+
+checking for countries that are in the test data that may not be in the training data.
+
+```{r}
+train_countries = unique(cdtrain$Country)
+test_countries = unique(cdtest$Country)
+new_countries = setdiff(test_countries, train_countries)
+print(new_countries)
+```
+
+Removing those countries from training data set
+
+```{r}
+cdtest = cdtest %>%
+  filter(Country %in% train_countries)
+```
+
+## Running logistic model first
+
+```{r}
+m1.log = glm(Churned ~ ., data = cdtrain, family = binomial)
+summary(m1.log)
+```
+
+```{r}
+vif(m1.log)
+```
+
+checked for multicollinearity and there is none between variables of our model.
+
+```{r}
+m1.pred = predict.glm(m1.log, newdata = cdtest, type = "response")
+predclass_log = ifelse(m1.pred >=.35, 1, 0)
+caret::confusionMatrix(as.factor(predclass_log), as.factor(cdtest$Churned), positive = "1")
+```
+
+#Results of Log Model
+
+The current model identified Average Order Value, Total Quantity, Country (Netherlands), and Customer Lifetime as the most statistically significant predictors of customer churn. Given the uneven distribution between churned and loyal customers, a cutoff threshold of 0.35 was applied. This setting produced an overall accuracy of 75.49%, with sensitivity at 77.44% and specificity at 74.75%.
+
+The confusion matrix indicates that 325 loyal customers were misclassified as churned. From a business standpoint, this outcome is acceptable since reaching out to these customers, perhaps through a reminder or promotional offer, still reinforces loyalty. However, the model failed to identify 111 actual churned customers, suggesting room for improvement. To address this, I plan to rerun the logistic regression with non-significant variables removed in hopes that a more streamlined model will enhance predictive performance.
+
+```{r}
+customer_data2 = customer_data %>% 
+  dplyr::select(-NumTransactions, -TotalRevenue, -NumCancelled)
+
+set.seed(369)
+tr_ind2 = sample(nrow(customer_data2), .7*nrow(customer_data2), replace = FALSE)
+cdtrain2 = customer_data2[tr_ind,]
+cdtest2 = customer_data2[-tr_ind,]
+
+```
+
+```{r}
+train_countries2 = unique(cdtrain2$Country)
+test_countries2 = unique(cdtest2$Country)
+new_countries2 = setdiff(test_countries2, train_countries2)
+print(new_countries)
+```
+
+```{r}
+cdtest2 = cdtest2 %>%
+  filter(Country %in% train_countries)
+```
+
+```{r}
+m2.log = glm(Churned ~ ., data = cdtrain2, family = binomial)
+summary(m2.log)
+```
+
+```{r}
+vif(m2.log)
+```
+
+```{r}
+m2.pred = predict.glm(m2.log, newdata = cdtest2, type = "response")
+predclass_log = ifelse(m2.pred >=.35, 1, 0)
+caret::confusionMatrix(as.factor(predclass_log), as.factor(cdtest$Churned), positive = "1")
+```
+
+Overall model accuracy for the second logistic regression decreased slightly to 75.04%, primarily due to a reduction in specificity to 74.20% and sensitivity down to 77.24%. The next step will involve running a Linear Discriminant Analysis (LDA) using the original dataset that includes all variables.
+
+## LDA MODEL
+
+Did not include country variable in LDA since some countries had customers that were either all loyal or all churned which was causing an error in LDA model
+
+```{r}
+m1.lda = lda(Churned ~ NumTransactions + TotalRevenue + 
+             AvgOrderValue + CustomerLifetime + 
+             NumCancelled, 
+             data = cdtrain)
+m1.lda
+```
+
+```{r}
+predclass_lda = predict(m1.lda, newdata = cdtest)
+caret::confusionMatrix(as.factor(predclass_lda$class), as.factor(cdtest$Churned), positive = "1")
+```
+
+# LDA Results
+
+The LDA model achieved an overall accuracy of 77.49%, with specificity at 81.51%. However, sensitivity, which reflects the model’s ability to correctly identify churned customers, was only 65.85%. From a business perspective, it is preferable to reach out to customers who may not churn rather than risk missing actual churners. Considering this, the logistic regression model remains the superior option at this stage. The next step will involve testing the dataset using a Support Vector Machine (SVM) model.
+
+# SVM MODEL
+
+```{r}
+cdtrain[["Churned"]] = factor(cdtrain[["Churned"]]) 
+
+form1 = Churned ~.
+
+tuned = tune.svm(form1, data = cdtrain, gamma = seq(.01, .1, by = .01), cost = seq(.1, 1, by = .1))
+tuned$best.parameters
+```
+
+```{r}
+mysvm = svm(formula = form1, data = cdtrain, gamma = tuned$best.parameters$gamma, cost = tuned$best.parameters$cost)
+summary(mysvm)
+```
+
+```{r}
+svmpredict = predict(mysvm, cdtest, type = "response")
+table(pred = svmpredict, true = cdtest$Churned)
+```
+
+```{r}
+svmpredict = factor(svmpredict, levels = c("0", "1"))
+cdtest$Churned = factor(cdtest$Churned, levels = c("0", "1"))
+
+confusionMatrix(svmpredict, cdtest$Churned, positive = "1")
+```
+
+The SVM model achieved an overall accuracy of 76.56%, with specificity at 94.02%, indicating strong performance in correctly identifying loyal customers. However, its sensitivity was the lowest among the three models at 30.89%, reflecting a limited ability to detect churned customers. Adjusting the churn threshold from 365 days to 300 days may enhance the model’s capacity to identify customers at risk of churn, potentially improving predictive balance.
+
+## Adjusting Customer data to have churn cut off at 200 days instead of 365
+
+```{r}
+customer_activity = df %>%
+  filter(!is.na(`Customer ID`)) %>%
+  group_by(`Customer ID`) %>%
+  summarise(
+    DaysSinceLastPurchase = as.numeric(difftime(observation_date, max(Date), units = "days")),
+    NumTransactions = n_distinct(Invoice),
+    TotalRevenue = sum(TotalPrice, na.rm = TRUE),
+    AvgOrderValue = TotalRevenue / n_distinct(Invoice),
+    TotalQuantity = sum(Quantity, na.rm = TRUE),
+    Country = first(Country),
+     NumCancelled = sum(OrderCancelled),
+    CustomerLifetime = as.numeric(difftime(max(Date), min(Date), units = "days"))
+  ) %>%
+  ungroup()
+
+customer_activity = customer_activity %>%
+  mutate(Churned = as.factor(ifelse(DaysSinceLastPurchase > 200, 1, 0)))
+```
+
+```{r}
+customer_data = customer_activity %>% 
+  dplyr::select(-`Customer ID`, -DaysSinceLastPurchase)
+```
+
+```{r}
+churn_summary <- customer_data %>%
+  count(Churned) %>%
+  mutate(Percent = n / sum(n) * 100)
+
+ggplot(churn_summary, aes(x = Churned, y = n, fill = Churned)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_text(aes(label = paste0(round(Percent, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("#2E8B57", "#E74C3C")) +
+  labs(title = "Customer Churn Distribution",
+       x = "Customer Status",
+       y = "Number of Customers",
+       fill = "Status") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Adjusting the churn cutoff from 365 to 200 days produced a more balanced representation of churned and loyal customers within the dataset. This refined definition of churn may allow the models to better capture early churn signals and improve overall predictive performance.
+
+# splitting dataset
+
+```{r}
+set.seed(369)
+tr_ind = sample(nrow(customer_data), .7*nrow(customer_data), replace = FALSE)
+cdtrain = customer_data[tr_ind,]
+cdtest = customer_data[-tr_ind,]
+```
+
+```{r}
+train_countries = unique(cdtrain$Country)
+test_countries = unique(cdtest$Country)
+new_countries = setdiff(test_countries, train_countries)
+print(new_countries)
+
+```
+
+```{r}
+cdtest = cdtest %>%
+  filter(Country %in% train_countries)
+```
+
+#Logistic Model 3
+
+```{r}
+m3.log = glm(Churned ~ ., data = cdtrain, family = binomial)
+summary(m3.log)
+```
+
+```{r}
+vif(m3.log)
+```
+
+```{r}
+m3.pred = predict.glm(m3.log, newdata = cdtest, type = "response")
+predclass_log = ifelse(m3.pred >=.35, 1, 0)
+caret::confusionMatrix(as.factor(predclass_log), as.factor(cdtest$Churned), positive = "1")
+```
+
+Our initial logistic regression model identified Average Order Value, Total Quantity, Country, and Customer Lifetime as significant predictors of churn. In the updated model, after lowering churn cutoff to 200 days, Number of Transactions and Number of Cancelled Orders also emerged as significant variables.
+
+Keeping all other factors constant, the model’s overall accuracy decreased slightly from 75.49% to 72.79%. However, sensitivity improved to 81.96% (from 77.44%), indicating stronger performance in identifying customers likely to churn earlier. Specificity fell to 66.94% (from 74.75%), but this trade-off is acceptable since failing to detect potential churners is more costly than misclassifying loyal customers.
+
+While the revised model introduces additional complexity and slightly lower overall accuracy, its enhanced ability to predict churn suggests meaningful progress toward a more proactive customer retention strategy.
+
+## LDA Model 2
+
+```{r}
+m2.lda = lda(Churned ~ NumTransactions + TotalRevenue + 
+             AvgOrderValue + CustomerLifetime + 
+             NumCancelled, 
+             data = cdtrain)
+m2.lda
+```
+
+```{r}
+predclass_lda = predict(m1.lda, newdata = cdtest)
+caret::confusionMatrix(as.factor(predclass_lda$class), as.factor(cdtest$Churned), positive = "1")
+```
+
+# LDA 2 results
+
+Overall accuracy for the LDA model decreased to 72.4% (from 77.49%), and specificity declined to 72.19% (from 81.51%). However, sensitivity improved from 65.85% to 72.73%, once again demonstrating that lowering the churn cutoff—while holding other factors constant—has enhanced our model’s ability to identify churned customers.
+
+Although the new LDA model achieves a more balanced trade-off between specificity and sensitivity, the primary business objective remains maximizing the detection of potential churners. Therefore, despite its slightly lower specificity, the logistic regression model remains the stronger choice due to its superior performance in predicting customers at risk of churn.
+
+## SVM 2
+
+```{r}
+cdtrain[["Churned"]] = factor(cdtrain[["Churned"]]) 
+
+form1 = Churned ~.
+
+tuned = tune.svm(form1, data = cdtrain, gamma = seq(.01, .1, by = .01), cost = seq(.1, 1, by = .1))
+tuned$best.parameters
+```
+
+```{r}
+mysvm = svm(formula = form1, data = cdtrain, gamma = tuned$best.parameters$gamma, cost = tuned$best.parameters$cost)
+summary(mysvm)
+```
+
+```{r}
+svmpredict = factor(svmpredict, levels = c("0", "1"))
+cdtest$Churned = factor(cdtest$Churned, levels = c("0", "1"))
+
+confusionMatrix(svmpredict, cdtest$Churned, positive = "1")
+```
+
+# SVM Model results
+
+The decline in performance may be due to the SVM’s sensitivity to class imbalance and parameter tuning, where the new churn definition shifted the class boundary but the model’s hyperparameters were not recalibrated accordingly. Additionally, the nonlinear relationships between predictors and churn may not have been fully captured with the current kernel settings.
+
+## FRAUD DETECTION
+
+Will be utilizing the dataset labeled "Df" to begin my fraud detection analysis.
+
+```{r}
+names(df)
+```
+
+```{r}
+negative_qty = df %>%
+  filter(Quantity < 0)
+
+nrow(negative_qty) 
+nrow(negative_qty) / nrow(df)*100  
+```
+
+When investigating potential fraud, the first thing I look for is the number of negative quantities. In this dataset, there appear to be around 18,000 negative quantities, which represent approximately 2.28% of the total. These amounts could indicate legitimate returns or something more clandestine.
+
+```{r}
+negative_qty %>%
+  group_by(Description) %>%
+  summarise(
+    NumReturns = n(),
+    TotalQtyReturned = sum(abs(Quantity)),
+    TotalValueReturned = sum(abs(Revenue))
+  ) %>%
+  arrange(desc(TotalValueReturned)) %>%
+  head(10)
+
+
+negative_qty %>%
+  group_by(Date) %>%
+  summarise(NumReturns = n()) %>%
+  ggplot(aes(x = Date, y = NumReturns)) +
+  geom_line() +
+  labs(title = "Returns Over Time", y = "Number of Returns") +
+  theme_minimal()
+```
+
+```{r}
+product_cancellations = df %>%
+  group_by(StockCode, Description) %>%
+  summarise(
+    TotalOrders = n(),
+    NumCancelled = sum(OrderCancelled),
+    CancellationRate = mean(OrderCancelled) * 100,
+    TotalRevenue = sum(Revenue, na.rm = TRUE)
+  ) %>%
+  filter(TotalOrders >= 20) %>%  # At least 20 orders
+  arrange(desc(CancellationRate)) %>%
+  head(20)
+
+print(product_cancellations)
+```
+
+When reviewing the 20 items with the highest cancellation rates, several patterns stand out that merit further investigation. First, there were 170 discount transactions issued, of which 165 were subsequently cancelled, resulting in a 97% cancellation rate and a total value of €12,785.34. This raises questions about why such a high proportion of discounts would be reversed, as it is unusual for discounts to be canceled at this scale. Next, the stock code ADJUST, with the description “Adjustment by John,” shows a total of 58 transactions, 26 of which were cancelled, yielding a 44.82% cancellation rate and total value of €2,769.17. The fact that John made multiple adjustments on the same day at different times is notable and may indicate process irregularities or potential misuse. Finally, the dataset contains a high volume of manual entries, totaling 1,078, of which 397 were cancelled,yielding a 36.82% cancellation rate and total value of €185,701.19. The combination of high-volume manual transactions and elevated cancellation rates further highlights areas where controls and transaction review may need to be strengthened. Overall, these patterns suggest that certain discount, adjustment, and manual transactions warrant closer scrutiny to determine whether they reflect legitimate corrections, operational anomalies, or potential misuse.
+
+```{r}
+
+```
+
+```{r}
+suspicious_codes = df %>%
+  filter(StockCode %in% c("ADJUST", "D", "M"))
+
+# 1. COUNTRY ANALYSIS - Bar Chart
+country_summary = suspicious_codes %>%
+  group_by(StockCode, Country) %>%
+  summarise(
+    NumTransactions = n(),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(country_summary, aes(x = reorder(Country, NumTransactions), 
+                             y = NumTransactions, 
+                             fill = StockCode)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Suspicious Stock Codes by Country",
+       subtitle = "ADJUST, D (Discount), M (Manual)",
+       x = "Country",
+       y = "Number of Transactions",
+       fill = "Stock Code") +
+  theme_minimal() +
+  scale_fill_manual(values = c("ADJUST" = "darkred", "D" = "coral", "M" = "orange"))
+
+```
+
+```{r}
+customer_summary = suspicious_codes %>%
+  filter(!is.na(`Customer ID`)) %>%
+  group_by(StockCode, `Customer ID`, Country) %>%
+  summarise(
+    NumTransactions = n(),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(StockCode, TotalRevenue)
+
+top_customers = customer_summary %>%
+  group_by(StockCode) %>%
+  slice_min(order_by = TotalRevenue, n = 15) %>%  # Most negative revenue
+  ungroup()
+
+ggplot(top_customers, aes(x = reorder(`Customer ID`, TotalRevenue), 
+                          y = TotalRevenue, 
+                          fill = Country)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~StockCode, scales = "free") +
+  labs(title = "Top 15 Customers Associated with Suspicious Stock Codes",
+       subtitle = "Showing customers with most negative revenue impact",
+       x = "Customer ID",
+       y = "Total Revenue (£)",
+       fill = "Country") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Summarize total number of transactions and total revenue for M, Adjust, and D
+cancel_summary <- suspicious_codes %>%
+  filter(StockCode %in% c("M", "ADJUST", "D")) %>%
+  group_by(StockCode) %>%
+  summarise(
+    TotalTransactions = n(),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(TotalTransactions))
+
+# View the summary table
+cancel_summary
+
+# Plot total revenue by StockCode
+ggplot(cancel_summary, aes(x = reorder(StockCode, TotalRevenue), 
+                           y = TotalRevenue, 
+                           fill = StockCode)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = comma(TotalRevenue)), 
+            hjust = -0.1, size = 4) +
+  coord_flip() +
+  labs(
+    title = "Total Transactions and Revenue by StockCode",
+    subtitle = "Filtered for StockCodes: M, ADJUST, and D",
+    x = "StockCode",
+    y = "Total Revenue"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1)))
+
+```
+
+
+
+```{r}
+ggplot(suspicious_codes, aes(x = Date, y = Revenue, color = StockCode)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~StockCode, ncol = 1) +
+  labs(title = "Timeline of Suspicious Transactions",
+       x = "Date",
+       y = "Revenue (£)") +
+  theme_minimal() +
+  scale_color_manual(values = c("ADJUST" = "darkred", "D" = "coral", "M" = "orange"))
+```
+
+```{r}
+print("=== SUMMARY BY STOCK CODE AND COUNTRY ===")
+suspicious_codes %>%
+  group_by(StockCode, Country) %>%
+  summarise(
+    Description,
+    NumTransactions = n(),
+    NumUniqueCustomers = n_distinct(`Customer ID`, na.rm = TRUE),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    AvgRevenue = mean(Revenue, na.rm = TRUE)
+  ) %>%
+  arrange(StockCode, desc(NumTransactions)) %>%
+  print(n = 50)
+
+```
+
+```{r}
+print("=== TOP CUSTOMERS BY STOCK CODE ===")
+suspicious_codes %>%
+  filter(!is.na(`Customer ID`)) %>%
+  group_by(StockCode, `Customer ID`, Country) %>%
+  summarise(
+    NumTransactions = n(),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    FirstDate = min(Date),
+    LastDate = max(Date)
+  ) %>%
+  group_by(StockCode) %>%
+  slice_min(order_by = TotalRevenue, n = 10) %>%
+  arrange(StockCode, TotalRevenue) %>%
+  print(n = 50)
+```
+
+```{r}
+suspicious_totals = suspicious_codes %>%
+  group_by(StockCode) %>%
+  summarise(
+    TotalTransactions = n(),
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    AvgRevenue = mean(Revenue, na.rm = TRUE),
+    MinRevenue = min(Revenue, na.rm = TRUE),
+    MaxRevenue = max(Revenue, na.rm = TRUE)
+  ) %>%
+  arrange(TotalRevenue)
+
+print("=== TOTAL VALUE BY SUSPICIOUS STOCK CODE ===")
+print(suspicious_totals)
+
+# Grand total across all suspicious codes
+grand_total = sum(suspicious_codes$Revenue, na.rm = TRUE)
+print(paste0("GRAND TOTAL (All Suspicious Codes): £", format(round(grand_total, 2), big.mark = ",")))
+
+# Percentage of total dataset revenue
+total_dataset_revenue = sum(df$Revenue, na.rm = TRUE)
+pct_of_total = (grand_total / total_dataset_revenue) * 100
+print(paste0("Percentage of Total Revenue: ", round(pct_of_total, 2), "%"))
+
+```
+
+significant anomalies have been identified that strongly suggest potential fraud. Three suspicious stock codes emerged with extraordinarily high cancellation rates and negative revenue: "D" (Discount) with 170 transactions and -£12,785.34, "ADJUST" (Adjustment by John) with 61 transactions and £12,038.12, and most critically, "M" (Manual) with 1,078 transactions totaling -£185,701.19 in losses—including a single transaction of -£38,970. Combined, these codes represent approximately -£186,448 in net losses. These transactions are concentrated among three customer accounts (IDs: 17364, 18102, 15098) and show suspicious patterns including same-day adjustments by "John" on January 26, 2010, and cancellation rates as high as 97%. The scale of losses, concentration of activity, and pattern of issuing large adjustments followed by cancellations indicate systematic misuse rather than isolated errors, suggesting potential embezzlement, unauthorized refunds, or deliberate data manipulation. Which regions have higher cancellation/return rates? The United Kingdom exhibits the highest concentration of suspicious activity, accounting for the vast majority of fraudulent transactions. The anomalies are not tied to legitimate product returns but rather to administrative system codes with excessive cancellation rates: Discount codes (97%), Manual adjustments (36.82%), and Adjustments by John (44.82%). Legitimate product categories show significantly lower return rates, isolating these administrative functions as the primary fraud risk. The evidence strongly suggests fraudulent activity concentrated in the UK market, perpetrated through manipulation of discount, adjustment, and manual entry systems, warranting immediate forensic audit and review of authorization controls for administrative transactions.
