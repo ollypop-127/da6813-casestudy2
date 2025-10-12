@@ -1,0 +1,2431 @@
+---
+title: "Case study 2"
+format: html
+editor: source
+---
+
+
+```{r}
+library(MASS)
+library(caret)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(car)
+library(sqldf)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(cluster)
+library(gridExtra)
+```
+
+# Question Answered in this file
+Which customers generate the most revenue (RFM analysis)?
+rs into groups (e.g., high-value, casual, wholesale)?
+Which countries contribute the most to sales growth?
+Which customers are at risk of churn?
+predict which customers are most likely to respond to promotions?
+How can pricing strategies be adjusted to increase basket value?
+Identify VIP customers and design loyalty/reward programs.
+Design personalized promotions for specific customer groups.
+Expand into high-performing countries based on purchase trends.
+
+# EDA
+
+```{r}
+df <- bind_rows(
+  read_excel("online_retail.xlsx", sheet = "Year 2009-2010"),
+  read_excel("online_retail.xlsx", sheet = "Year 2010-2011"))
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+str(df)
+```
+Categorical Variables:
+Invoice
+StockCode
+Description
+Country
+InvoiceDate
+
+Numerical Variables:
+Quantity
+Price
+Customer ID
+
+
+```{r}
+# check for NA's
+# Description NA's... those products still matter but what are they
+colSums(is.na(df))
+```
+Customer ID is missing a ton of values, does that mean those aren't sales? the quantity still changes so there were sales that existed but for some reason there aren't Customer ID's, not sure what that indicates
+
+# Data Cleaning
+
+## Important: Stock code M will need to be removed when modeling stock
+M is manual override. For some reason, the product information was lost but the sales, quantity, and customer info was retained for that sale. Keeping M in for the meantime to accurately track sales and customer spending. Weird however that on an online store isn't accurately tracking the stock being bought.
+
+df <- df |> 
+  filter(!StockCode %in% c("M"))
+
+
+```{r}
+# Check for duplicates
+nrow(df)  # Total rows
+nrow(distinct(df))  # Unique rows
+```
+```{r}
+# Remove exact duplicate rows only
+df <- df |> 
+  distinct()
+nrow(df)
+```
+
+
+```{r}
+# trim spaces in character columns
+df <- df |> 
+  mutate(across(where(is.character), trimws))
+
+# Remove completely empty strings
+df <- df |> 
+  mutate(across(where(is.character), ~na_if(., "")))
+```
+
+
+```{r}
+# make a new column Revenue as the product of price and quantity
+df <- df |> 
+  mutate(Revenue = Price * Quantity)
+
+# convert InvoiceDate to Date format
+df$InvoiceDate <- as.Date(df$InvoiceDate)
+```
+
+
+```{r}
+head(df)
+```
+
+```{r}
+# Fill NAs in Description with the most common description for each StockCode
+df <- df |> 
+  group_by(StockCode) |> 
+  mutate(
+    Description = ifelse(is.na(Description), 
+                        first(Description[!is.na(Description)]), 
+                        Description)
+  ) |> 
+  ungroup()
+
+# check null results now
+df |> 
+  filter(is.na(Description)) |> 
+  nrow()
+colSums(is.na(df))
+```
+```{r}
+# See which StockCodes still have null descriptions
+null_by_stockcode <- df |> 
+  filter(is.na(Description)) |> 
+  group_by(StockCode) |> 
+  summarise(
+    Count = n(),
+    Sample_Invoice = first(Invoice),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Count))
+
+print(null_by_stockcode)
+```
+
+
+```{r}
+# Remove POST and DOT, postage isn't a product they actually sell, they just charge for it
+
+df <- df |> 
+  filter(!StockCode %in% c("POST", "DOT"))
+
+# Verify they're gone
+df |> 
+  filter(StockCode %in% c("POST", "DOT")) |> 
+  nrow()  
+
+```
+
+
+```{r}
+# negative quantities I don't want to necessarily completely delete since they may be useful
+# Separate returns/adjustments from regular sales
+# df will be the sales df 
+returns_df <- df |> 
+  filter(Quantity < 0)
+
+df <- df |> 
+  filter(Quantity > 0)
+
+```
+
+```{r}
+# View all rows with negative quantities
+
+# See how many there are
+nrow(returns_df)
+
+# View them
+head(returns_df)
+```
+
+```{r}
+# looks like for some of them it's the same customer doing the negative quantity
+returns_df |> 
+  select(`Customer ID`, Invoice, StockCode, Description, Quantity, Price, Country, InvoiceDate)
+
+```
+
+
+```{r}
+# rows with 0 price, don't want to completely get rid of them in case we need them later
+# the 0 price rows also have some with no description, but they do have quantities
+# Save zero-price rows to separate dataset
+zero_price_df <- df |> 
+  filter(Price == 0)
+
+# Remove zero-price rows from df
+df <- df |> 
+  filter(Price > 0)
+
+# Verify
+cat("Zero price dataset:", nrow(zero_price_df), "rows\n")
+cat("Main dataset:", nrow(df), "rows\n")
+cat("Total:", nrow(zero_price_df) + nrow(df), "rows\n")
+```
+```{r}
+# View all rows with negative prices
+# Description says adjust bad debt, maybe some kind of charge back
+# They have a stock code of just B
+
+# See how many there are
+nrow(zero_price_df)
+
+# View them
+head(zero_price_df)
+```
+
+B = Bad debt
+
+```{r}
+# Remove B stock code
+df <- df |> 
+  filter(!StockCode %in% c("B"))
+```
+
+
+
+# More EDA
+
+```{r}
+# See the earliest and latest dates
+# Spans 2 years
+range(df$InvoiceDate, na.rm = TRUE)
+```
+
+```{r}
+# Unique Products
+unique_products <- n_distinct(df$StockCode)
+cat("Unique Products:", unique_products, "\n")
+
+# Unique Customers
+unique_customers <- n_distinct(df$`Customer ID`, na.rm = TRUE)
+cat("Unique Customers:", unique_customers, "\n")
+
+# Unique Countries
+unique_countries <- n_distinct(df$Country)
+cat("Unique Countries:", unique_countries, "\n")
+
+# Unique Transactions
+unique_transactions <- n_distinct(df$Invoice)
+cat("Unique Transactions:", unique_transactions, "\n")
+```
+```{r}
+# Monthly, weekly transactions
+
+# Monthly transaction counts
+monthly_transactions <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_transactions)
+
+# Average per month
+cat("\nAverage Transactions per Month:", 
+    round(mean(monthly_transactions$Transactions), 1), "\n")
+
+# Weekly transaction counts
+weekly_transactions <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Revenue = sum(Quantity * Price, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(head(weekly_transactions))
+
+# Average per week
+cat("Average Transactions per Week:", 
+    round(mean(weekly_transactions$Transactions), 1), "\n")
+```
+
+```{r}
+# Monthly weekly Revenue
+
+# Monthly revenue
+monthly_revenue <- df |> 
+  mutate(YearMonth = floor_date(InvoiceDate, "month")) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(monthly_revenue)
+
+# Average per month
+cat("\nAverage Revenue per Month: £", 
+    format(round(mean(monthly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+
+# Weekly revenue
+weekly_revenue <- df |> 
+  mutate(Week = floor_date(InvoiceDate, "week")) |> 
+  group_by(Week) |> 
+  summarise(
+    Transactions = n_distinct(Invoice),
+    Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Revenue_Per_Transaction = round(sum(Revenue, na.rm = TRUE) / n_distinct(Invoice), 2),
+    .groups = 'drop'
+  )
+
+print(head(weekly_revenue, 20))
+
+# Average per week
+cat("Average Revenue per Week: £", 
+    format(round(mean(weekly_revenue$Total_Revenue), 0), big.mark = ","), "\n")
+```
+
+
+
+# Which countries contribute the most to Sales growth?
+UK, Ireland, Netherlands, Germany, France
+
+```{r}
+# revenue by country
+# Most of the distribution is in the UK and the rest of Europe
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+```{r}
+df |> 
+  group_by(Country) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>  # top 5
+  ggplot(aes(x = reorder(Country, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Countries by Total Revenue",
+       x = "Country",
+       y = "Total Revenue") +
+  theme_minimal()
+```
+
+# What are the top-selling products?
+
+```{r}
+# top selling products
+# M is manual, you can't track what M is
+# 22423, 85123A, M
+df |> 
+  group_by(StockCode) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+
+```{r}
+df |> 
+  filter(!is.na(Description)) |>  # Remove rows with NA descriptions
+  group_by(StockCode) |> 
+  summarise(
+    TotalRevenue = sum(Revenue, na.rm = TRUE),
+    Description = first(Description)  # Get first description for each StockCode
+  ) |> 
+  arrange(desc(TotalRevenue)) |>
+  head(5) |>
+  ggplot(aes(x = reorder(Description, TotalRevenue), y = TotalRevenue)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 5 Products by Total Revenue",
+       x = "Product Description",
+       y = "Total Revenue") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+
+```{r}
+# revenue grouped by customer
+# most of the revenue doesn't have a customer ID, who is buying all of this then
+# Highest buying customers, 18102, 14646
+df |> 
+  group_by(`Customer ID`) |> 
+  summarise(TotalRevenue = sum(Revenue, na.rm = TRUE)) |> 
+  arrange(desc(TotalRevenue))
+```
+
+
+
+# Time Series
+
+```{r}
+# Create daily sales summary
+daily_sales <- df |> 
+  group_by(InvoiceDate) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(InvoiceDate)
+
+head(daily_sales)
+summary(daily_sales)
+```
+
+
+```{r}
+# Create monthly sales summary
+monthly_sales <- df |> 
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate),
+    YearMonth = floor_date(InvoiceDate, "month")  # First day of each month
+  ) |> 
+  group_by(YearMonth) |> 
+  summarise(
+    Num_Transactions = n_distinct(Invoice),
+    Num_Items_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Customers = n_distinct(`Customer ID`, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  arrange(YearMonth)
+
+# View monthly data
+print(monthly_sales)
+
+# Plot monthly sales
+ggplot(monthly_sales, aes(x = YearMonth, y = Num_Transactions)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 3) +
+  labs(title = "Monthly Sales Transactions",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot monthly revenue
+ggplot(monthly_sales, aes(x = YearMonth, y = Total_Revenue)) +
+  geom_line(color = "darkgreen", size = 1.2) +
+  geom_point(color = "darkgreen", size = 3) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Monthly Revenue",
+       x = "Month",
+       y = "Total Revenue (£)") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+# monthly sales and transactions
+monthly_sales <- monthly_sales |> 
+  mutate(
+    Revenue_Scaled = Total_Revenue / max(Total_Revenue) * max(Num_Transactions)
+  )
+
+ggplot(monthly_sales, aes(x = YearMonth)) +
+  # Revenue bars
+  geom_col(aes(y = Revenue_Scaled), fill = "lightgreen", alpha = 0.7) +
+  # Transaction line
+  geom_line(aes(y = Num_Transactions), color = "steelblue", size = 1.5) +
+  geom_point(aes(y = Num_Transactions), color = "steelblue", size = 3) +
+  labs(title = "Sales Transactions and Revenue Over Time",
+       subtitle = "Blue line: Transactions | Green bars: Revenue",
+       x = "Month",
+       y = "Number of Transactions") +
+  theme_minimal() +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Product Sales
+
+
+```{r}
+
+# Identify top-selling products by quantity
+top_products <- df |> 
+  group_by(StockCode, Description) |> 
+  summarise(
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    .groups = 'drop'
+  ) |> 
+  filter(!is.na(Description), Total_Quantity_Sold > 0) |> 
+  arrange(desc(Total_Quantity_Sold)) |> 
+  head(10)
+
+print(top_products)
+
+# Select top 3-5 products for forecasting
+key_stockcodes <- top_products$StockCode[1:5]
+```
+
+```{r}
+# Monthly demand for top products
+monthly_demand <- df |> 
+  filter(StockCode %in% top_products$StockCode) |> 
+  mutate(Month = floor_date(InvoiceDate, "month")) |> 
+  group_by(StockCode, Description, Month) |> 
+  summarise(
+    Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(monthly_demand)
+```
+
+
+# Seasonal buying patterns
+
+Percentage shows what proportion of that product's total annual revenue came from that specific season.
+
+```{r}
+# extract month from InvoiceDate
+df <- df |> 
+  mutate(
+    Month = month(InvoiceDate, label = TRUE),
+    Month_Num = month(InvoiceDate),
+    Year = year(InvoiceDate)
+  )
+
+# Define the seasonal periods you want to analyze
+seasonal_analysis <- df |> 
+  mutate(
+    Season_Period = case_when(
+      Month_Num %in% c(2, 3) ~ "Feb-Mar Spike",
+      Month_Num %in% c(4, 5) ~ "Apr-May Spike",
+      Month_Num %in% c(8, 9, 10, 11, 12) ~ "Aug-Dec (Holiday Season)",
+      TRUE ~ "Other Months"
+    )
+  )
+
+# Top products by season
+top_products_by_season <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  group_by(Season_Period, Description) |> 
+  summarise(
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    Avg_Price = mean(Price, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 20) |>  # Top 20 products per season
+  ungroup()
+
+print(top_products_by_season)
+
+# Compare revenue by season period
+season_revenue_summary <- seasonal_analysis |> 
+  group_by(Season_Period) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Orders = n_distinct(Invoice),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Unique_Products = n_distinct(StockCode),
+    Avg_Order_Value = Total_Revenue / Total_Orders,
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Total_Revenue))
+
+print(season_revenue_summary)
+
+# Look for products that are UNIQUE to spike periods
+# (appear heavily in spike months but not in other months)
+spike_specific_products <- seasonal_analysis |> 
+  group_by(Description, Season_Period) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    Quantity = sum(Quantity, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  pivot_wider(
+    names_from = Season_Period,
+    values_from = c(Revenue, Quantity),
+    values_fill = 0
+  ) |> 
+  # Calculate what % of product's revenue comes from each season
+  mutate(
+    Total_Revenue = `Revenue_Feb-Mar Spike` + `Revenue_Apr-May Spike` + 
+                    `Revenue_Aug-Dec (Holiday Season)` + `Revenue_Other Months`,
+    FebMar_Pct = round(`Revenue_Feb-Mar Spike` / Total_Revenue * 100, 1),
+    AprMay_Pct = round(`Revenue_Apr-May Spike` / Total_Revenue * 100, 1),
+    AugDec_Pct = round(`Revenue_Aug-Dec (Holiday Season)` / Total_Revenue * 100, 1)
+  ) |> 
+  filter(Total_Revenue > 1000) |>  # Only products with meaningful revenue
+  arrange(desc(FebMar_Pct))
+
+# Products heavily concentrated in Feb-Mar
+febmar_products <- spike_specific_products |> 
+  filter(FebMar_Pct >= 40) |>  # 40%+ of revenue in Feb-Mar
+  select(Description, FebMar_Pct, `Revenue_Feb-Mar Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Feb-Mar Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN FEB-MAR ===")
+print(head(febmar_products, 15))
+
+# Products heavily concentrated in Apr-May
+aprmay_products <- spike_specific_products |> 
+  filter(AprMay_Pct >= 40) |>
+  select(Description, AprMay_Pct, `Revenue_Apr-May Spike`, Total_Revenue) |>
+  arrange(desc(`Revenue_Apr-May Spike`))
+
+print("=== PRODUCTS CONCENTRATED IN APR-MAY ===")
+print(head(aprmay_products, 15))
+
+# Products heavily concentrated in Aug-Dec
+augdec_products <- spike_specific_products |> 
+  filter(AugDec_Pct >= 60) |>  # Higher threshold since this is longer period
+  select(Description, AugDec_Pct, `Revenue_Aug-Dec (Holiday Season)`, Total_Revenue) |>
+  arrange(desc(`Revenue_Aug-Dec (Holiday Season)`))
+
+print("=== PRODUCTS CONCENTRATED IN AUG-DEC ===")
+print(head(augdec_products, 15))
+
+# Look at product keywords/themes
+# Extract common words from product descriptions in each season
+library(tidytext)
+
+season_keywords <- seasonal_analysis |> 
+  filter(Season_Period != "Other Months") |> 
+  select(Season_Period, Description, Revenue) |> 
+  unnest_tokens(word, Description) |> 
+  anti_join(stop_words, by = "word") |>  # Remove common words like "the", "and"
+  filter(!word %in% c("set", "pack", "vintage", "red", "white", "blue", "pink")) |>  # Remove generic words
+  group_by(Season_Period, word) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Count = n(),
+    .groups = 'drop'
+  ) |> 
+  group_by(Season_Period) |> 
+  arrange(Season_Period, desc(Total_Revenue)) |> 
+  slice_head(n = 15)
+
+print("=== TOP KEYWORDS BY SEASON ===")
+print(season_keywords)
+```
+
+# Results
+Overall Revenue Distribution:
+
+Aug-Dec (Holiday Season): $9.1M (53%) - Dominates as expected
+Apr-May Spike: $2.3M (13%)
+Feb-Mar Spike: $2.2M (13%)
+Other Months: $3.6M (21%)
+
+
+Feb-Mar Spike Products -Valentine's & Early Spring
+
+Key Themes:
+Red & Hearts - Valentine's Day focus
+Door Mat Hearts (52.4% of sales in Feb-Mar)
+Pack of 12 Red Spotty Tissues (51.7%)
+Jumbo Bag Red White Spotty (42.3%)
+
+Home Decor - Spotty/Polka Dot Pattern
+Door mats with spots (multiple variations 40-60% concentrated)
+Retro Spot Cake Stand (41.3%)
+These appear to be spring/fresh design themes
+
+
+Easter Prep Beginning
+Easter Craft 4 Chicks (66.9%)
+Small Fairy Cake Fridge Magnets (94.2%) - likely spring/Easter themed
+
+
+February-March spike is driven by Valentine's Day (hearts, red colors) and early Easter/spring preparation (craft items, fresh spotty patterns). 
+
+Apr-May Spike Products (Easter, Gardening, Outdoor Season)
+Key Themes:
+
+Outdoor/Garden Products - Spring gardening season
+Wooden Rounders Garden Set (48.9% - $10,263!)
+Wooden Croquet Garden Set (40.9%)
+Wooden Skittles Garden Set (51.9%)
+Gardeners Kneeling Pad (45.7%)
+Watering Can Green Dinosaur (43.1%)
+
+Picnic/Outdoor Dining
+Picnic Basket Wicker Large (42.3%)
+Set of 4 New England Placemats (91.5%)
+
+Outdoor Décor
+Large Red Retrospot Windmill (64.4%)
+Small Red Retrospot Windmill (40.6%)
+
+Pet/Animal Bowls
+Dog Bowl Chasing Ball Design (53.5%)
+Cat bowls (multiple, 40-72% concentrated)
+
+
+April-May spike is outdoor/garden season - customers buying for spring gardening, outdoor games, and picnicking. This is UK spring when people start spending time in gardens. Also includes Easter items.
+
+Aug-Dec Products (Christmas Dominance)
+Key Themes:
+
+Christmas Decorations
+Paper Chain Kit 50's Christmas (94.9%)
+Paper Chain Kit Vintage Christmas (96.7%)
+Rotating Silver Angels T-Light Holder (98.9%)
+Chilli Lights (62.2%)
+
+
+Gift Items
+Paper Craft Little Birdie (100% in this period!)
+Assorted Colour Bird Ornament (60.5%)
+
+Winter Warmth Products
+Chocolate Hot Water Bottle (86.2%)
+Scottie Dog Hot Water Bottle (87.0%)
+Hand Warmer Owl Design (99.2%)
+Red Woolly Hottie White Heart (82.1%)
+
+Holiday Lighting
+Rabbit Night Light (89.1%)
+Colour Glass Star T-Light Holder (66.4%)
+
+
+Aug-Dec is heavily Christmas-focused as expected, with decorations, lights, and gift items. Also includes cozy winter products (hot water bottles, hand warmers) for cold weather comfort.
+
+
+Inventory Planning:
+
+Jan-Feb: Stock up on Valentine's items (hearts, red colors) and Easter craft supplies
+Mar-Apr: Bring in garden sets, outdoor games, picnic items, windmills
+Jul-Aug: Massive Christmas inventory buildup - decorations, lights, hot water bottles
+
+Marketing Calendar:
+
+Feb: Valentine's Day campaigns (hearts, red spotty items)
+Mar: Easter crafts and spring home décor
+Apr-May: Garden season promotions (outdoor games, picnic supplies)
+Aug-Dec: Christmas dominates - shift to holiday gifting, decorations, cozy items
+
+
+# RFM Customer Segmentation
+
+## Important: rows with Customer ID need to be removed since we can't identify those
+
+```{r}
+# Save null customer ID rows to separate dataset
+null_customer_df <- df |> 
+  filter(is.na(`Customer ID`))
+
+# Remove from main dataset
+df <- df |> 
+  filter(!is.na(`Customer ID`))
+
+# Summary
+cat("Null customer rows:", nrow(null_customer_df), "\n")
+cat("Main dataset:", nrow(df), "\n")
+```
+
+
+```{r}
+
+# Define analysis date - day after the last transaction)
+analysis_date <- max(df$InvoiceDate, na.rm = TRUE) + 1
+
+# Create RFM dataset
+rfm_data <- df |> 
+  filter(!is.na(`Customer ID`)) |> # remove rows without Customer ID since we can't identify those customers
+  group_by(`Customer ID`) |> 
+  summarise(
+    
+    # Recency- Days since last purchase
+    Recency = as.numeric(analysis_date - max(InvoiceDate, na.rm = TRUE)),
+    
+    # Frequency- Number of unique invoices/purchases
+    Frequency = n_distinct(Invoice),
+    
+    # Monetary- Total revenue
+    Monetary = sum(Revenue, na.rm = TRUE),
+    
+    .groups = 'drop'
+  ) |> 
+  filter(Monetary > 0)  # remove customers with negative or zero monetary value
+
+head(rfm_data)
+summary(rfm_data)
+```
+
+## Analyze the distributions
+There are some outliers, Recency is skewed to the right, Frequency is only slightly right skewed, monetary is really just at 0 
+
+```{r}
+
+
+# histograms for each RFM component
+p1 <- ggplot(rfm_data, aes(x = Recency)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Recency Distribution", x = "Days Since Last Purchase")
+
+p2 <- ggplot(rfm_data, aes(x = Frequency)) +
+  geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.7) +
+  labs(title = "Frequency Distribution", x = "Number of Purchases")
+
+p3 <- ggplot(rfm_data, aes(x = Monetary)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.7) +
+  labs(title = "Monetary Distribution", x = "Total Revenue") +
+  scale_x_continuous(labels = scales::comma)
+
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+## Standardize the data for clustering
+
+```{r}
+# create dataset for clustering
+rfm_for_clustering <- rfm_data |> 
+  select(Recency, Frequency, Monetary) |> 
+  mutate(
+    # Log transform Monetary to handle skew
+    Monetary_log = log1p(Monetary),
+    # Log transform Frequency for skew
+    Frequency_log = log1p(Frequency),
+    # Log transform Recency
+    Recency_log = log1p(Recency)
+  ) |> 
+  select(Recency_log, Frequency_log, Monetary_log) |> 
+  scale() |>   # Standardize variables
+  as.data.frame()
+
+# Add Customer ID back
+rfm_for_clustering$CustomerID <- rfm_data$`Customer ID`
+```
+
+## Determine optimal number of clusters
+
+3 seems to be the most optimal
+```{r}
+
+# Prepare data for clustering (remove CustomerID)
+cluster_data <- rfm_for_clustering |> select(-CustomerID)
+
+# Calculate within-cluster sum of squares for different k values
+wss <- numeric(10)
+
+for (k in 1:10) {
+  kmeans_temp <- kmeans(cluster_data, centers = k, nstart = 25)
+  wss[k] <- kmeans_temp$tot.withinss
+}
+
+# Plot the elbow curve
+plot(1:10, wss, type = "b", 
+     xlab = "Number of Clusters (k)", 
+     ylab = "Within-Cluster Sum of Squares",
+     main = "Elbow Method for Optimal k",
+     pch = 19, col = "blue")
+grid()
+
+
+# Silhouette method
+silhouette_scores <- numeric(9)
+
+for (k in 2:10) {
+  kmeans_temp <- kmeans(cluster_data, centers = k, nstart = 25)
+  sil <- silhouette(kmeans_temp$cluster, dist(cluster_data))
+  silhouette_scores[k-1] <- mean(sil[, 3])
+}
+
+# Plot silhouette scores
+plot(2:10, silhouette_scores, type = "b",
+     xlab = "Number of Clusters (k)",
+     ylab = "Average Silhouette Score",
+     main = "Silhouette Method for Optimal k",
+     pch = 19, col = "darkgreen")
+grid()
+```
+# K means clustering
+
+```{r}
+set.seed(123)  
+k_optimal <- 3
+
+kmeans_result <- kmeans(cluster_data, centers = k_optimal, nstart = 25)
+
+# Add cluster assignments back to original data
+rfm_data$Cluster <- as.factor(kmeans_result$cluster)
+```
+
+
+# Customer segments
+Wholesale: Avg_Monetary ≥ 8,000 (captures high-spending customers)
+High-Value: Avg_Recency < 200 AND Avg_Monetary ≥ 1,000 (recent, moderate spenders)
+Casual: Everything else (inactive/low-value customers)
+
+Monetary is strongest differentiator, recency was second factor
+
+Cluster 1 (Wholesale):
+1,251 customers, Freq 18.9, Monetary $10,468
+
+Cluster 2 (Casual):
+2,359 customers, Freq 1.5, Monetary $393
+
+Cluster 3 (High-Value):
+2,267 customers, Freq 4.2, Monetary $1,418
+
+Revenue distribution
+Wholesale: 76.0% of revenue
+High-Value: 18.6% of revenue
+Casual: 5.4% of revenue
+
+```{r}
+# analyze and interpret
+# Summarize clusters
+# Step 6: Analyze and Interpret Clusters (Updated with Wholesale naming)
+
+# Summarize clusters
+cluster_summary <- rfm_data |> 
+  group_by(Cluster) |> 
+  summarise(
+    Count = n(),
+    Avg_Recency = round(mean(Recency), 1),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    .groups = 'drop'
+  ) |> 
+  arrange(Cluster)
+
+print(cluster_summary)
+
+cluster_summary <- cluster_summary |> 
+  mutate(
+    Segment = case_when(
+      # Wholesale - High monetary value (even with moderate frequency)
+      Avg_Monetary >= 8000 ~ "Wholesale",
+      
+      # High-Value - Recent and decent monetary
+      Avg_Recency < 200 & Avg_Monetary >= 1000 ~ "High-Value",
+      
+      # Casual - Everything else
+      TRUE ~ "Casual"
+    )
+  )
+
+print(cluster_summary)
+
+# revenue contribution by segment
+segment_analysis <- cluster_summary |> 
+  mutate(
+    Total_Revenue = Count * Avg_Monetary,
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1),
+    Customer_Percent = round(Count / sum(Count) * 100, 1)
+  ) |> 
+  select(Segment, Cluster, Count, Customer_Percent, Avg_Monetary, Total_Revenue, Revenue_Percent)
+
+print(segment_analysis)
+```
+
+
+
+## Visualize segments
+Casual and high value seem to have a bit of overlap due to their monetary values being more similar and frequency is not that far apart
+
+```{r}
+library(plotly)
+
+# 3D scatter plot
+plot_ly(rfm_data, 
+        x = ~Recency, y = ~Frequency, z = ~Monetary,
+        color = ~Cluster,
+        type = "scatter3d",
+        mode = "markers") |> 
+  layout(title = "Customer Segments in RFM Space")
+
+# 2D plots
+p1 <- ggplot(rfm_data, aes(x = Recency, y = Monetary, color = Cluster)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Recency vs Monetary by Cluster") +
+  scale_y_continuous(labels = scales::comma)
+
+p2 <- ggplot(rfm_data, aes(x = Frequency, y = Monetary, color = Cluster)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Frequency vs Monetary by Cluster") +
+  scale_y_continuous(labels = scales::comma)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+# Top revenue generating customers
+
+Top 10 customers are 16% of total revenue (2.7M out of 17.2M)
+Top 20% of customers are 77.3% of total revenue (13.3M out of 17.2M)
+Business is heavily dependent on small group of customers, losing a few of them could greatly negatively impact the business
+Customer retention is critical, need risk management strategies to protect against losing key customers
+Growth opportunity for getting more sales from mid-tier customers since this 80% of customers only contribute to 24% of the revenue
+
+
+```{r}
+# Find top revenue-generating customers
+top_customers <- rfm_data |> 
+  arrange(desc(Monetary)) |> 
+  head(20) |>   # Top 20 
+  select(`Customer ID`, Recency, Frequency, Monetary, Cluster)
+print(top_customers)
+
+# Calculate what % of revenue they represent
+top_10_revenue <- rfm_data |> 
+  arrange(desc(Monetary)) |> 
+  head(10) |> 
+  summarise(
+    Top10_Revenue = sum(Monetary),
+    Total_Revenue = sum(rfm_data$Monetary),
+    Percentage = round(Top10_Revenue / Total_Revenue * 100, 1)
+  )
+print(top_10_revenue)
+
+# Top 20%
+revenue_distribution <- rfm_data |> 
+  summarise(
+    Total_Customers = n(),
+    Total_Revenue = sum(Monetary),
+    Top_20pct_Revenue = sum(Monetary[Monetary >= quantile(Monetary, 0.8)]),
+    Top_20pct_Percentage = round(Top_20pct_Revenue / Total_Revenue * 100, 1)
+  )
+print(revenue_distribution)
+```
+
+# Churn Analysis for enhancing Promotion and VIP offers
+Recency is the main churn indicator
+
+Cluster 1: Recency = 34 days, they're highly engaged and active
+Cluster 3: Recency = 107 days, moderate engagement
+
+Churn risk groups
+Active: 0-180 days (within 6 months - reasonable for seasonal)
+At Risk: 181-365 days (haven't purchased in last holiday season)
+High Risk: 366-545 days (missed multiple seasons)
+Churned: 545+ days (18 months - likely gone for good)
+
+Example: Someone who bought garden items in May and hasn't returned by September (120 days) isn't churned - they're just not in garden season. Same thing could be said for other holidays or seasons
+
+```{r}
+# For seasonal/Christmas retail, customers naturally have longer purchase cycles
+# Need to account for the seasonal nature of the business
+
+churn_analysis <- rfm_data |> 
+  mutate(
+    Churn_Risk = case_when(
+      Recency <= 180 ~ "Active",          # Purchased within 6 months
+      Recency <= 365 ~ "At Risk",         # 6-12 months (missed last season)
+      Recency <= 545 ~ "High Risk",       # 12-18 months (missed 1-2 seasons)
+      TRUE ~ "Churned"                     # 18+ months (likely gone)
+    ),
+    # Convert to factor for proper ordering
+    Churn_Risk = factor(Churn_Risk, 
+                        levels = c("Active", "At Risk", "High Risk", "Churned"))
+  )
+
+# Summary of churn risk distribution
+churn_summary <- churn_analysis |> 
+  group_by(Churn_Risk) |> 
+  summarise(
+    Customer_Count = n(),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    Total_Revenue = round(sum(Monetary), 0),
+    .groups = 'drop'
+  ) |> 
+  mutate(
+    Customer_Percent = round(Customer_Count / sum(Customer_Count) * 100, 1),
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(churn_summary)
+
+# Identify high-value customers at risk
+high_value_at_risk <- churn_analysis |> 
+  filter(Churn_Risk %in% c("At Risk", "High Risk", "Churned")) |> 
+  filter(Monetary >= 1000 | Frequency >= 3) |>  # Lowered frequency threshold for seasonal
+  arrange(desc(Monetary)) |> 
+  select(`Customer ID`, Recency, Frequency, Monetary, Churn_Risk, Cluster)
+
+print(head(high_value_at_risk, 20))
+
+# Count of high-value at-risk customers
+high_value_at_risk_summary <- high_value_at_risk |> 
+  group_by(Churn_Risk) |> 
+  summarise(
+    Count = n(),
+    Total_At_Risk_Revenue = sum(Monetary),
+    Avg_Monetary = round(mean(Monetary), 0)
+  )
+
+print(high_value_at_risk_summary)
+```
+## Results
+
+Overall Churn Distribution
+
+Active
+- 59.2% of customers are Active (3,477 customers)
+- These active customers drive 86.5% of total revenue ($14.9M)
+- Average value: $4,290 per active customer
+
+40.8% Show Churn Risk
+- 787 At Risk + 1,062 High Risk + 551 Churned = 2,400 customers at risk
+- Collectively represent 13.4% of revenue ($2.3M at stake)
+
+At Risk (787 customers - 13.4%)
+- Gone 6-12 months (181-365 days)
+- Average value: $1,323
+- Total potential revenue: $1.04M (6.0%)
+- Prime targets for win-back campaigns, they're still reachable
+
+High Risk (1,062 customers - 18.1%)
+- Gone 12-18 months (366-545 days)
+- Average value: $876
+- Total potential revenue: $930K (5.4%)
+- Harder to recover but still worth trying
+
+Churned (551 customers - 9.4%)
+- Gone 18+ months (545+ days)
+- Average value: $640
+- Total potential revenue: $353K (2.0%)
+- Mostly lost, minimal investment warranted
+
+High-Value At-Risk Customers 
+- 572 previously valuable customers need immediate attention
+
+At Risk Segment (407 customers):
+- Total historical value: $913K
+- Average value: $2,244 per customer
+- These aren't small buyers - they're customers who used to spend significantly
+
+At risk by customer:
+Customer 12346: $277K historical value, gone 326 days
+Customer 16754: $65K historical value, gone 373 days
+Customer 13093: $54K historical value, gone 276 days
+Customer 17850: $155K historical value, gone 372 days
+
+Don't Chase: Churned (551 customers, $353K)
+- Been gone 18+ months
+- ROI likely negative except for very high-value accounts
+
+## Sensitivity analysis
+
+```{r}
+# Test different threshold scenarios
+sensitivity_scenarios <- list(
+  "Conservative" = c(150, 300, 450),   # Stricter - faster to label as at-risk
+  "Current" = c(180, 365, 545),        # Current thresholds
+  "Lenient" = c(210, 400, 600)         # More forgiving - slower to label churned
+)
+
+# Function to calculate churn distribution for given thresholds
+calculate_churn <- function(thresholds, data) {
+  data |> 
+    mutate(
+      Churn_Risk = case_when(
+        Recency <= thresholds[1] ~ "Active",
+        Recency <= thresholds[2] ~ "At Risk",
+        Recency <= thresholds[3] ~ "High Risk",
+        TRUE ~ "Churned"
+      )
+    ) |> 
+    group_by(Churn_Risk) |> 
+    summarise(
+      Count = n(),
+      Percent = round(n() / nrow(data) * 100, 1),
+      Avg_Monetary = round(mean(Monetary), 0),
+      .groups = 'drop'
+    )
+}
+
+# Run sensitivity analysis
+sensitivity_results <- map_dfr(
+  names(sensitivity_scenarios),
+  function(scenario_name) {
+    thresholds <- sensitivity_scenarios[[scenario_name]]
+    calculate_churn(thresholds, rfm_data) |> 
+      mutate(Scenario = scenario_name, .before = 1)
+  }
+)
+
+print(sensitivity_results)
+
+# Compare key metrics across scenarios
+scenario_comparison <- sensitivity_results |> 
+  group_by(Scenario) |> 
+  summarise(
+    Active_Pct = Percent[Churn_Risk == "Active"],
+    AtRisk_Pct = Percent[Churn_Risk == "At Risk"],
+    AtRisk_Revenue = Avg_Monetary[Churn_Risk == "At Risk"],
+    Total_AtRisk_HighRisk = sum(Count[Churn_Risk %in% c("At Risk", "High Risk")]),
+    .groups = 'drop'
+  )
+
+print(scenario_comparison)
+```
+
+Active Customer %:
+
+Conservative: 56.1%
+Current: 59.2%
+Lenient: 61.8%
+Range: Only 5.7 percentage points
+
+At Risk Customer %:
+
+Conservative: 13.2%
+Current: 13.4%
+Lenient: 16.7%
+Relatively stable, though lenient definition captures more
+
+Total At Risk + High Risk Customers:
+
+Conservative: 1,701 customers
+Current: 1,849 customers
+Lenient: 1,882 customers
+Range: Only 181 customers difference (10.6% variation)
+
+At Risk Average Revenue:
+
+All scenarios show $1,225-$1,323 range
+Very consistent - the same type of customers fall into "At Risk" regardless of thresholds
+
+
+
+## Churn Risk table
+
+```{r}
+# How does churn risk vary by customer segment?
+churn_by_segment <- rfm_data |>
+  select(`Customer ID`, Cluster) |>
+  left_join(churn_analysis |> select(`Customer ID`, Churn_Risk), by = "Customer ID") |>
+  group_by(Cluster, Churn_Risk) |>
+  summarise(Count = n(), .groups = 'drop') |>
+  group_by(Cluster) |>
+  mutate(Percent = round(Count / sum(Count) * 100, 1)) |>
+  arrange(Cluster, Churn_Risk)
+
+print(churn_by_segment)
+```
+## Results
+
+Cluster 1 (Wholesale) - Exceptionally Low Churn
+Active: 1,212 customers (96.9%)
+At Risk: 24 (1.9%)
+High Risk: 13 (1.0%)
+Churned: 2 (0.2%)
+
+Only 39 customers (3.1%) show any churn risk. This is exceptional customer loyalty.The rare Wholesale customer showing churn is a critical exception requiring immediate personal attention - they're anomalies in an otherwise rock-solid segment.
+
+Cluster 2 (Casual) - Most Churn
+Active: 447 (18.9%)
+At Risk: 492 (20.9%)
+High Risk: 889 (37.7%)
+Churned: 531 (22.5%)
+
+81% of Cluster 2 customers are at-risk or churned. This segment is hemorrhaging customers.
+Cluster 2 only contributes 5.4% of revenue ($927K out of $17.2M). One time buyers.
+
+Cluster 3 (High-Value) - Healthy with Manageable Churn
+Active: 1,818 customers (80.2%)
+At Risk: 271 (12.0%)
+High Risk: 160 (7.1%)
+Churned: 18 (0.8%)
+
+80% retention with only 0.8% fully churned. The 431 at-risk customers (19.8%) are the best intervention opportunity - proven value ($1,418 average), good loyalty (4.2 purchases), and reachable.
+
+
+# Promotion
+
+Targeting Priorities
+Critical - VIP Priority: 39 At-Risk Wholesale Customers (Cluster 1)
+
+Personal outreach required - phone calls or in-person meetings, not emails
+Premium offers - 25%+ discounts, VIP treatment
+White-glove service - assign dedicated account managers
+Total potential value: These 39 customers represent ~$616K in historical value ($15,787 average)
+Why critical: In a segment with 97% retention, these are exceptional cases with average 20.5 purchases - clear relationship failures requiring immediate executive intervention
+
+High Priority: 858 customers (mostly Cluster 3 High-Value)
+
+Targeted email campaigns with personalized product recommendations
+Strong offers - 15-20% discounts plus free shipping
+Early season access to new holiday collections
+Total potential value: $1.05M ($1,227 average per customer)
+Goal: Re-engage proven loyal customers (20.3 avg purchases) who've been inactive ~3 months
+
+Medium Priority: 1,369 customers
+
+Standard seasonal email campaigns with product highlights
+Moderate offers - 10% discount codes
+Total potential value: $343K ($250 average per customer)
+Goal: Cost-effective reactivation of moderate-value customers
+
+Low Priority: 1,645 customers
+
+Generic email blasts only - minimal personalization
+Basic offers - 5-10% discounts
+Total potential value: $184K ($112 average per customer)
+
+Do NOT Target: 1,966 customers (33.5%)
+
+Save the budget - one-time buyers who never engaged (1.6 avg purchases)
+Total potential value: $81K but cost to reactivate exceeds likely return
+Better to invest in customer acquisition than chasing customers who never engaged
+
+Logic Behind the Strategy
+We're identifying customers who are:
+
+Reachable - not too active already (don't need incentive), not completely lost (beyond recovery)
+Valuable - worth the promotional investment based on historical spend
+Likely to respond - demonstrated loyalty/engagement through repeat purchases
+
+
+The Scoring System
+Core RFM Weights:
+
+Recency (50% weight): Primary identifier of who needs intervention now
+Frequency (30% weight): Past loyalty predicts future response - customers with 5+ purchases respond better
+Monetary (20% weight): Indicates value to justify promotional cost
+
+Cluster Bonus Enhancement:
+
++3 points for Wholesale (Cluster 1): Highest priority segment
++1 point for High-Value (Cluster 3): Moderate boost
++0 points for Casual (Cluster 2): No boost - limited engagement history
+
+Why the Cluster Bonus Matters
+After discovering that 97% of Wholesale customers maintain active status, we recognized that any Wholesale customer showing churn risk represents a critical exception requiring immediate attention. These aren't normal churn cases - they're relationship failures in an otherwise highly loyal segment, suggesting:
+
+Service issues that can be resolved
+Opportunity to demonstrate we value the relationship before it's too late
+
+At $15,787 average value and 20.5 purchase history, each represents a significant relationship worth salvaging.
+
+Score ranges:
+Critical VIP or High Priority 9.0-13.0
+Medium Priority 7.0-8.9
+Low Priority 5.0-6.9
+Do Not Target 0-4.9
+
+```{r}
+promotion_targeting <- rfm_data |> 
+  # Add churn risk to rfm_data
+  mutate(
+    Churn_Risk = case_when(
+      Recency <= 180 ~ "Active",
+      Recency <= 365 ~ "At Risk",
+      Recency <= 545 ~ "High Risk",
+      TRUE ~ "Churned"
+    ),
+    Churn_Risk = factor(Churn_Risk, 
+                        levels = c("Active", "At Risk", "High Risk", "Churned"))
+  ) |>
+  mutate(
+    # Score components
+    Recency_Score = case_when(
+      Recency <= 90 ~ 2,
+      Recency <= 180 ~ 8,
+      Recency <= 365 ~ 10,
+      Recency <= 545 ~ 6,
+      TRUE ~ 2
+    ),
+    
+    Frequency_Score = case_when(
+      Frequency >= 10 ~ 10,
+      Frequency >= 5 ~ 8,
+      Frequency >= 2 ~ 6,
+      TRUE ~ 3
+    ),
+    
+    Monetary_Score = case_when(
+      Monetary >= 5000 ~ 10,
+      Monetary >= 2000 ~ 8,
+      Monetary >= 1000 ~ 6,
+      Monetary >= 500 ~ 4,
+      TRUE ~ 2
+    ),
+    
+    # Cluster bonus
+    Cluster_Bonus = case_when(
+      Cluster == "1" ~ 3,
+      Cluster == "3" ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Promotion score
+    Promotion_Score = round(
+      (Recency_Score * 0.5 + Frequency_Score * 0.3 + Monetary_Score * 0.2) + Cluster_Bonus, 1
+    ),
+    
+    # Priority
+    Promotion_Priority = case_when(
+      Cluster == "1" & Churn_Risk %in% c("At Risk", "High Risk", "Churned") ~ "Critical - VIP",
+      Promotion_Score >= 9 ~ "High Priority",
+      Promotion_Score >= 7 ~ "Medium Priority",
+      Promotion_Score >= 5 ~ "Low Priority",
+      TRUE ~ "Do Not Target"
+    ),
+    
+    Promotion_Priority = factor(Promotion_Priority,
+                                levels = c("Critical - VIP", "High Priority", 
+                                          "Medium Priority", "Low Priority", "Do Not Target"))
+  )
+
+
+promotion_summary <- promotion_targeting |> 
+  group_by(Promotion_Priority) |> 
+  summarise(
+    Customer_Count = n(),
+    Avg_Promotion_Score = round(mean(Promotion_Score), 1),
+    Avg_Recency = round(mean(Recency), 0),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Monetary = round(mean(Monetary), 0),
+    Total_Potential_Revenue = sum(Monetary),
+    .groups = 'drop'
+  ) |> 
+  mutate(
+    Customer_Percent = round(Customer_Count / sum(Customer_Count) * 100, 1),
+    Revenue_Percent = round(Total_Potential_Revenue / sum(Total_Potential_Revenue) * 100, 1)
+  )
+
+print(promotion_summary)
+
+```
+
+## Results
+The Promotion Response Prediction Model Logic
+
+Most Likely to Respond (Highest Scores):
+Recency: 180-365 days (need nudge to return)
+Frequency: 5+ purchases (proven loyalty to brand)
+Monetary: $1,000+ (valuable enough to justify promotional investment)
+Segment: Wholesale or High-Value customers (demonstrated commitment)
+
+Least Likely to Respond (Lowest Scores):
+Recency: <90 days (already active, don't need incentive) OR >545 days (too far gone)
+Frequency: 1-2 purchases (never truly engaged with brand)
+Monetary: <$500 (low value, questionable ROI)
+Segment: Casual customers (minimal relationship to salvage)
+
+
+The Prediction Results
+We identified 897 customers (15.3%) who are most likely to respond:
+
+Critical - VIP (39 customers - 0.7%):
+Prediction: Extremely high response probability (score 11.9)
+Profile: Previously super loyal (20.5 purchases, $15,787 average value) but now inactive for 10+ months
+Why they'll respond: Deep purchase history shows they know and trust the brand. They just need a compelling reason to re-engage
+
+High Priority (858 customers - 14.6%):
+Prediction: High response probability (score 9.3)
+Profile: Strong history (20.3 purchases, $1,227 value), recently gone inactive (~3 months)
+Why they'll respond: Still within reachable window; recent enough that brand remains top-of-mind
+
+Combined top tiers: 897 customers averaging $1,857 in lifetime value
+
+
+We identified 1,966 customers (33.5%) who are least likely to respond:
+
+One-time buyers (1.6 purchases average) - never truly engaged
+Long gone (297 days recency) - formed new shopping habits
+Low value ($41 average) - cost to reactivate exceeds return
+Basically already churned - promotional offers unlikely to generate positive ROI
+
+
+# VIP Customers and loyalty programs
+
+```{r}
+# Define VIP criteria 
+vip_customers <- rfm_data |> 
+  mutate(
+    # Calculate percentile rankings
+    Monetary_Percentile = percent_rank(Monetary),
+    Frequency_Percentile = percent_rank(Frequency),
+    Recency_Percentile = 1 - percent_rank(Recency),  # Lower recency is better
+    
+    # VIP Score (weighted combination)
+    VIP_Score = (Monetary_Percentile * 0.5) + 
+                (Frequency_Percentile * 0.3) + 
+                (Recency_Percentile * 0.2),
+    
+    # VIP Tiers
+    VIP_Tier = case_when(
+      VIP_Score >= 0.95 ~ "Diamond VIP",      # Top 5%
+      VIP_Score >= 0.90 ~ "Platinum VIP",     # Top 10%
+      VIP_Score >= 0.80 ~ "Gold VIP",         # Top 20%
+      VIP_Score >= 0.70 ~ "Silver VIP",       # Top 30%
+      TRUE ~ "Regular"
+    )
+  )
+
+# VIP tier summary
+vip_summary <- vip_customers |> 
+  group_by(VIP_Tier) |> 
+  summarise(
+    Count = n(),
+    Avg_Monetary = round(mean(Monetary), 0),
+    Avg_Frequency = round(mean(Frequency), 1),
+    Avg_Recency = round(mean(Recency), 0),
+    Total_Revenue = sum(Monetary),
+    .groups = 'drop'
+  ) |> 
+  mutate(
+    Customer_Percent = round(Count / sum(Count) * 100, 1),
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  ) |> 
+  arrange(desc(Total_Revenue))
+
+print(vip_summary)
+
+# Top 50 VIP customers (Diamond + top Platinum)
+top_vips <- vip_customers |> 
+  arrange(desc(VIP_Score)) |> 
+  head(50) |> 
+  select(`Customer ID`, Monetary, Frequency, Recency, Cluster, VIP_Score, VIP_Tier)
+
+print(top_vips)
+
+# Diamond VIPs (Top 5%) - Your absolute best
+diamond_vips <- vip_customers |> 
+  filter(VIP_Tier == "Diamond VIP") |> 
+  arrange(desc(Monetary)) |>
+  select(`Customer ID`, Monetary, Frequency, Recency, Cluster, VIP_Score)
+
+print(diamond_vips)
+
+# VIP customers by cluster
+vip_by_cluster <- vip_customers |> 
+  filter(VIP_Tier %in% c("Diamond VIP", "Platinum VIP", "Gold VIP")) |>
+  group_by(Cluster, VIP_Tier) |> 
+  summarise(
+    Count = n(),
+    Avg_Monetary = round(mean(Monetary), 0),
+    .groups = 'drop'
+  )
+
+print(vip_by_cluster)
+
+
+# How much do VIPs contribute?
+vip_contribution <- vip_customers |>
+  mutate(
+    VIP_Category = case_when(
+      VIP_Tier %in% c("Diamond VIP", "Platinum VIP") ~ "Top 10% VIPs",
+      VIP_Tier == "Gold VIP" ~ "Top 20% VIPs",
+      VIP_Tier == "Silver VIP" ~ "Top 30% VIPs",
+      TRUE ~ "Regular Customers"
+    )
+  ) |>
+  group_by(VIP_Category) |>
+  summarise(
+    Customers = n(),
+    Total_Revenue = sum(Monetary),
+    .groups = 'drop'
+  ) |>
+  mutate(
+    Customer_Percent = round(Customers / sum(Customers) * 100, 1),
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(vip_contribution)
+```
+# Tier strategy
+
+1. Scoring Components
+
+Recency Score (20% weight):
+Measures how recently a customer purchased
+Calculated using percentile ranking (lower recency = better score)
+Recent customers are more engaged and valuable
+
+Frequency Score (30% weight):
+Measures purchase frequency (number of orders)
+Calculated using percentile ranking
+Frequent purchasers demonstrate loyalty and brand affinity
+
+Monetary Score (50% weight):
+Measures total lifetime spending
+Calculated using percentile ranking
+Highest weight because revenue directly impacts business value
+High-spending customers justify premium service investment
+
+
+2. VIP Score Calculation
+Formula:
+VIP Score = (Monetary Percentile × 0.50) + 
+            (Frequency Percentile × 0.30) + 
+            (Recency Percentile × 0.20)
+Weights:
+Monetary (50%): Direct revenue impact
+Frequency (30%): Loyalty indicator- predicts future value
+Recency (20%): Engagement- weighted lower because seasonal business patterns mean customers naturally have gaps
+
+
+3. Tier Assignment
+Customers were segmented into tiers based on their composite VIP Score:
+Diamond >=0.95
+Platinum 0.90-0.949
+Gold 0.80-0.899
+Silver 0.70-0.799
+Regular <0.70
+
+# Results
+
+Revenue
+Top 10% (588 customers) = 49.6% of revenue ($8.5M out of $17.2M)
+Top 20% (1,155 customers) = 69.1% of revenue ($11.9M)
+Top 30% (1,732 customers) = 80.5% of revenue ($13.8M)
+
+Diamond Tier- 294 customers
+Average spend: $39,948 (~£30K each)
+Average frequency: 53 purchases 
+Average recency: 61 days
+Total revenue: $11.7M (68% of all revenue)
+Diamond tier is primarily wholesale buyers, not individual consumers
+
+Platinum - 294 customers
+Average spend: $10,657
+Average frequency: 22 purchases
+Average recency: 142 days
+Total revenue: $3.1M (18%)
+
+Gold -567 customers
+Average spend: $4,213
+Average frequency: 9 purchases
+Average recency: 143 days
+Total revenue: $2.4M (14%)
+
+Silver- 577 customers
+Average spend: $3,408
+Average frequency: 7 purchases
+Average recency: 172 days
+Total revenue: $2.0M (11%)
+
+## What the VIPS get in the loyalty program
+
+Diamond Tier -294 customers generate 68% of revenue
+Entry Requirement: £25,000+ annual spend (currently $39,948 avg)
+Updated Benefits (B2B-Focused):
+
+Financial Rewards:
+Quarterly rebates: 2% cashback on total annual spend (up to £800/year on £40K spend)
+Free shipping on ALL orders (domestic & international)
+Price protection: 90-day price matching
+
+Business Support:
+Dedicated Account Manager with direct phone/email
+Same-day order processing (orders by 2pm ship today)
+Priority inventory allocation during high-demand periods
+90-day flexible returns policy
+
+Recognition:
+Anniversary gifts (£200+ value at 1, 3, 5 year milestones)
+Customer spotlight feature (marketing opportunity for their business)
+
+
+Platinum Tier 294 customers
+Entry Requirement: £8,000+ annual spend (currently $10,657 avg)
+Benefits (Hybrid B2B/B2C):
+
+Financial Rewards:
+Free UK shipping, 50% off international
+
+Support:
+Priority customer service line (4-hour response)
+Next-day order processing
+Dedicated email support
+
+Perks:
+£50 birthday voucher
+60-day extended returns window
+
+
+Gold Tier -567 customers
+Entry Requirement: £3,000+ annual spend (currently $4,213 avg)
+Benefits (Primarily B2C with some B2B):
+
+Financial Rewards:
+Free UK shipping on orders £50+
+
+
+Access:
+Members-only products
+Early notification of seasonal sales
+
+
+Service:
+Priority customer service
+30-day free returns
+
+
+Recognition:
+Gold welcome kit with member card
+Seasonal greeting cards
+
+
+
+Silver Tier -577 customers
+Entry Requirement: £2,500+ annual spend (currently $3,408 avg)
+Benefits (Primarily B2C):
+
+Financial Rewards:
+Free UK shipping on orders £100+
+
+Access:
+Monthly VIP newsletter
+
+Recognition:
+Silver member card
+Birthday email
+
+## Potential investment and ROI
+
+Annual Program Investment: ~£2.95M
+
+Diamond tier: £2.3M (account managers, 2% cashback, free shipping, gifts)
+Platinum tier: £380K (shipping discounts, priority support, vouchers)
+Gold/Silver tiers: £270K (shipping thresholds, welcome kits, basic perks)
+
+
+Expected Returns: ~£3.3M+
+Direct Revenue Impact:
+
+Churn Reduction: ~£800K
+Reduce Diamond churn by 50%: £300K retained
+Reduce Platinum/Gold churn by 30%: £500K retained
+
+
+Spend Increase: ~£2M
+Diamond customers increase 10% with better service: £1.2M
+Platinum/Gold increase 15% with recognition: £800K
+
+
+Referral Revenue: ~£500K
+20% of VIPs refer new customers averaging £2,500 spend
+
+
+
+Total Measurable Benefit: £3.3M
+
+Net Financial ROI: +£350K (12% return)
+The real value:
+Risk Protection: £11.7M:
+294 Diamond customers = 68% of total revenue (£11.7M)
+Losing just 10% of Diamonds (29 customers) = £1.2M revenue loss
+Program cost (£2.95M) is essentially insurance on £11.7M in high-risk revenue
+
+# Countries that contribute the most to sales growth
+
+```{r}
+# Create time periods for comparison
+df <- df |> 
+  mutate(
+    Year = year(InvoiceDate),
+    Month = month(InvoiceDate),
+    Quarter = quarter(InvoiceDate),
+    YearMonth = floor_date(InvoiceDate, "month")
+  )
+
+# Overall revenue by country
+revenue_by_country <- df |> 
+  group_by(Country) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Orders = n_distinct(Invoice),
+    Total_Customers = n_distinct(`Customer ID`),
+    Avg_Order_Value = Total_Revenue / Total_Orders,
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Total_Revenue)) |>
+  mutate(
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(head(revenue_by_country, 15))
+
+# Year-over-year growth by country
+yearly_country_revenue <- df |> 
+  group_by(Country, Year) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Country) |> 
+  arrange(Country, Year) |> 
+  mutate(
+    Previous_Year_Revenue = lag(Revenue),
+    Growth_Amount = Revenue - Previous_Year_Revenue,
+    Growth_Rate = round((Revenue - Previous_Year_Revenue) / Previous_Year_Revenue * 100, 1)
+  ) |> 
+  filter(!is.na(Growth_Rate))  # Remove first year (no comparison)
+
+print(yearly_country_revenue |> arrange(desc(Growth_Amount)))
+
+# Quarter-over-quarter growth for more granular view
+quarterly_country_revenue <- df |> 
+  group_by(Country, Year, Quarter) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  mutate(YearQuarter = paste(Year, "Q", Quarter, sep = "")) |>
+  group_by(Country) |> 
+  arrange(Country, Year, Quarter) |> 
+  mutate(
+    Previous_Quarter_Revenue = lag(Revenue),
+    QoQ_Growth_Amount = Revenue - Previous_Quarter_Revenue,
+    QoQ_Growth_Rate = round((Revenue - Previous_Quarter_Revenue) / Previous_Quarter_Revenue * 100, 1)
+  )
+
+# Find countries with strongest recent growth (last quarter)
+recent_growth <- quarterly_country_revenue |> 
+  group_by(Country) |> 
+  arrange(Country, Year, Quarter) |> 
+  slice_tail(n = 1) |>  # Most recent quarter
+  filter(!is.na(QoQ_Growth_Rate)) |>
+  arrange(desc(QoQ_Growth_Amount))
+
+print(head(recent_growth, 15))
+
+# Month-over-month trend for top countries (to see momentum)
+top_countries <- revenue_by_country |> 
+  slice_head(n = 10) |> 
+  pull(Country)
+
+monthly_top_countries <- df |> 
+  filter(Country %in% top_countries) |>
+  group_by(Country, YearMonth) |> 
+  summarise(
+    Revenue = sum(Revenue, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Country) |> 
+  arrange(Country, YearMonth) |> 
+  mutate(
+    MoM_Growth_Rate = round((Revenue - lag(Revenue)) / lag(Revenue) * 100, 1)
+  )
+
+# Average growth rate by country (across all periods)
+avg_growth_by_country <- monthly_top_countries |> 
+  group_by(Country) |> 
+  summarise(
+    Avg_MoM_Growth = round(mean(MoM_Growth_Rate, na.rm = TRUE), 1),
+    Median_MoM_Growth = round(median(MoM_Growth_Rate, na.rm = TRUE), 1),
+    Latest_Revenue = last(Revenue),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Avg_MoM_Growth))
+
+print(avg_growth_by_country)
+
+# Growth contribution - which countries contributed most to absolute revenue growth
+total_growth_contribution <- yearly_country_revenue |> 
+  group_by(Country) |> 
+  summarise(
+    Total_Growth_Amount = sum(Growth_Amount, na.rm = TRUE),
+    Avg_Growth_Rate = round(mean(Growth_Rate, na.rm = TRUE), 1),
+    .groups = 'drop'
+  ) |> 
+  arrange(desc(Total_Growth_Amount)) |>
+  mutate(
+    Growth_Contribution_Pct = round(Total_Growth_Amount / sum(Total_Growth_Amount) * 100, 1)
+  )
+
+print(head(total_growth_contribution, 15))
+
+# Emerging markets - countries with high growth rates even if small base
+emerging_markets <- yearly_country_revenue |> 
+  group_by(Country) |> 
+  summarise(
+    Avg_Growth_Rate = mean(Growth_Rate, na.rm = TRUE),
+    Latest_Revenue = last(Revenue),
+    .groups = 'drop'
+  ) |> 
+  filter(Latest_Revenue > 10000) |>  # At least $10K revenue (exclude tiny markets)
+  arrange(desc(Avg_Growth_Rate))
+
+print(head(emerging_markets, 10))
+```
+
+# Results
+
+Overall Revenue DistributionMarket Concentration:
+
+United Kingdom: $17.1M (85.3%)
+EIRE (Ireland): $659K (3.3%) 
+Netherlands: $550K (2.7%) 
+Top 3 countries = 91.3% of total revenue
+
+Top Growth Contributors (Total Growth Amount):
+
+United Kingdom: +$7.3M (84.2% of total growth)
+Growth rate: 517% (2009→2010: from $729K to $8.3M)
+Latest monthly revenue: $571K
+
+Netherlands: +$260K (3.0% of growth)
+Growth rate: 816%
+Average monthly growth: 15.3%
+Latest revenue: $11,728/month
+Fastest-growing major market
+
+EIRE (Ireland): +$253K (2.9% of growth)
+Growth rate: 847%
+Average monthly growth: 20.4%
+Latest revenue: $7,341/month
+Strong market growth
+
+Germany: +$186K (2.1% of growth)
+Growth rate: 998%
+Latest revenue: $7,024/month
+
+France: +$180K (2.1% of growth)
+Growth rate: 1,115%
+Latest revenue: $6,539/month
+
+
+Emerging High-Growth Markets
+Countries with Highest Growth Rates:
+
+Sweden: 9,532% average growth
+From nearly 0 to $33K
+Latest revenue: $33K/month
+Explosive growth from new market entry
+
+Australia: 5,932% growth
+Now at $137K latest revenue
+Monthly growth: 267% average
+
+Switzerland: 4,406% growth
+Now at $52K
+Monthly growth: 63.5%
+
+Belgium: 3,956% growth
+Now at $35K
+
+Norway: 3,174% growth
+Now at $30K
+
+
+Recent Momentum (Most Recent Quarter Growth)
+Q4 2011 Quarter-over-Quarter Growth:
+
+Strongest Absolute Growth:
+
+United Kingdom: +$722K (35.2% QoQ) - Still driving bulk of growth
+Germany: +$12K (24.2% QoQ)
+Netherlands: +$11K (15.7% QoQ)
+France: +$24K (55.6% QoQ)
+
+Explosive Percentage Growth (smaller markets):
+
+Cyprus: +2,340% QoQ (from $196 to $4,790)
+USA: +733% QoQ (from $384 to $3,196)
+Singapore: +79% QoQ
+Italy: +227% QoQ
+
+
+Monthly Growth Trends (Sustained Momentum)
+Countries with Highest Average Monthly Growth:
+
+Netherlands: 15.3% average monthly growth
+Australia: 267% average 
+Denmark: 256% average 
+Sweden: 177% average
+Switzerland: 63.5% average
+UK: 3.5% average monthly growth - Slower but massive revenue ($571K/month)
+
+
+Recommendations:
+
+UK- Continue investing heavily in UK market. This is our core business.
+
+Netherlands- Study what's working in Netherlands (is there specific products they're more interested in?. Replicate Netherlands strategy in similar markets like Belgium, Luxembourg, or Scandinavia.
+Why Netherlands:
+- Highest sustained monthly growth (15.3%) among major markets
+- Contributed $260K in growth (largest international contributor)
+- 816% growth rate
+= Latest revenue: $11,728/month
+
+Australia Wildcard - maybe we're selling well there due to lack of competition.
+Why Australia:
+- 5,932% growth - massive expansion
+- $137K in latest quarter (significant size)
+- 267% average monthly growth - fastest-growing established market
+- Geographically distant but culturally similar -English-speaking, similar holidays
+
+
+
+
+## High performing countries based on purchasing trends
+
+```{r}
+top_products_by_country <- df |> 
+  filter(Country %in% c("United Kingdom", "Australia", "Netherlands")) |>
+  group_by(Country, Description) |> 
+  summarise(
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Num_Orders = n_distinct(Invoice),
+    Avg_Price = mean(Price, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  group_by(Country) |> 
+  arrange(Country, desc(Total_Revenue)) |> 
+  slice_head(n = 15) |>  # Top 15 per country
+  ungroup()
+
+# View results
+
+print(top_products_by_country |> filter(Country == "United Kingdom"))
+
+
+print(top_products_by_country |> filter(Country == "Australia"))
+
+
+print(top_products_by_country |> filter(Country == "Netherlands"))
+
+# What products are popular across all three?
+popular_across_markets <- df |> 
+  filter(Country %in% c("United Kingdom", "Australia", "Netherlands")) |>
+  group_by(Description, Country) |> 
+  summarise(Revenue = sum(Revenue, na.rm = TRUE), .groups = 'drop') |>
+  pivot_wider(names_from = Country, values_from = Revenue, values_fill = 0) |>
+  mutate(
+    Total_Revenue = `United Kingdom` + Australia + Netherlands,
+    In_All_Three = (`United Kingdom` > 0) & (Australia > 0) & (Netherlands > 0)
+  ) |>
+  filter(In_All_Three == TRUE) |>
+  arrange(desc(Total_Revenue))
+
+
+print(head(popular_across_markets, 20))
+```
+
+# Results
+Product sales
+
+UK- Mix of home décor, gifting items, and seasonal decorations.
+Australia- Functional lighting (night lights), Children's products (lunch boxes), Kitchen organization (tins, storage)
+Netherlands- Storage/organization products dominate (snack boxes), plus children's lunch boxes and night lights. Similar to Australia.
+Australia/Netherlands: More year-round practical items
+
+Recommendation- selling more children's products and practical items such as kitchen organization seems like it could be a good strategy for performing well in practical markets. UK sales are more season/holiday dependent and those products may not directly translate everywhere else.
+
+# Pricing strategy to increase basket value
+
+```{r}
+# current basket value analysis
+basket_analysis <- df |>
+  filter(!is.na(`Customer ID`)) |>
+  group_by(Invoice, `Customer ID`) |>
+  summarise(
+    Basket_Value = sum(Revenue, na.rm = TRUE),
+    Items_in_Basket = n_distinct(StockCode),
+    Total_Quantity = sum(Quantity, na.rm = TRUE),
+    Avg_Item_Price = mean(Price, na.rm = TRUE),
+    Invoice_Date = first(InvoiceDate),
+    .groups = 'drop'
+  ) |>
+  filter(Basket_Value > 0)  # Remove negative/zero baskets
+
+# Overall basket statistics
+basket_summary <- basket_analysis |>
+  summarise(
+    Total_Baskets = n(),
+    Avg_Basket_Value = round(mean(Basket_Value), 2),
+    Median_Basket_Value = round(median(Basket_Value), 2),
+    Avg_Items_Per_Basket = round(mean(Items_in_Basket), 1),
+    Median_Items_Per_Basket = round(median(Items_in_Basket), 0),
+    Pct_Single_Item_Baskets = round(sum(Items_in_Basket == 1) / n() * 100, 1)
+  )
+
+print(basket_summary)
+
+# Basket value distribution
+basket_distribution <- basket_analysis |>
+  mutate(
+    Basket_Segment = case_when(
+      Basket_Value < 50 ~ "Under £50",
+      Basket_Value < 100 ~ "£50-£100",
+      Basket_Value < 250 ~ "£100-£250",
+      Basket_Value < 500 ~ "£250-£500",
+      Basket_Value < 1000 ~ "£500-£1,000",
+      TRUE ~ "Over £1,000"
+    )
+  ) |>
+  group_by(Basket_Segment) |>
+  summarise(
+    Count = n(),
+    Total_Revenue = sum(Basket_Value),
+    Avg_Items = round(mean(Items_in_Basket), 1),
+    .groups = 'drop'
+  ) |>
+  mutate(
+    Basket_Percent = round(Count / sum(Count) * 100, 1),
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(basket_distribution)
+
+
+# Product Bundle opportunities- Products frequently bought together
+product_pairs <- df |>
+  filter(!is.na(`Customer ID`)) |>
+  filter(Revenue > 0) |>
+  select(Invoice, Description, Revenue) |>
+  group_by(Invoice) |>
+  filter(n() >= 2) |>  # Only baskets with 2+ items
+  ungroup()
+
+# Create product combinations within same basket
+product_combinations <- product_pairs |>
+  inner_join(product_pairs, by = "Invoice", relationship = "many-to-many") |>
+  filter(Description.x < Description.y) |>  # Avoid duplicates
+  group_by(Description.x, Description.y) |>
+  summarise(
+    Times_Bought_Together = n(),
+    Total_Combined_Revenue = sum(Revenue.x + Revenue.y),
+    .groups = 'drop'
+  ) |>
+  filter(Times_Bought_Together >= 10) |>  # At least 10 co-purchases
+  arrange(desc(Times_Bought_Together))
+
+print(head(product_combinations, 20))
+
+
+# Cross-sell opportunities by customer segment
+cross_sell_by_cluster <- df |>
+  filter(!is.na(`Customer ID`)) |>
+  inner_join(rfm_data |> select(`Customer ID`, Cluster), by = "Customer ID") |>
+  group_by(Invoice, `Customer ID`, Cluster) |>
+  summarise(
+    Basket_Value = sum(Revenue, na.rm = TRUE),
+    Items_Count = n_distinct(StockCode),
+    .groups = 'drop'
+  ) |>
+  group_by(Cluster) |>
+  summarise(
+    Avg_Basket_Value = round(mean(Basket_Value), 2),
+    Avg_Items_Per_Basket = round(mean(Items_Count), 1),
+    Median_Basket_Value = round(median(Basket_Value), 2),
+    Total_Baskets = n(),
+    .groups = 'drop'
+  )
+
+print(cross_sell_by_cluster)
+
+
+# single item basket analysis
+single_item_baskets <- basket_analysis |>
+  filter(Items_in_Basket == 1) |>
+  inner_join(
+    df |> select(Invoice, Description, StockCode),
+    by = "Invoice"
+  ) |>
+  group_by(Description) |>
+  summarise(
+    Single_Item_Purchases = n(),
+    Avg_Single_Basket_Value = round(mean(Basket_Value), 2),
+    Total_Revenue = sum(Basket_Value),
+    .groups = 'drop'
+  ) |>
+  arrange(desc(Single_Item_Purchases))
+
+print(head(single_item_baskets, 20))
+
+
+# price point analysis
+price_point_analysis <- df |>
+  filter(!is.na(`Customer ID`), Revenue > 0) |>
+  mutate(
+    Price_Band = case_when(
+      Price < 1 ~ "Under £1",
+      Price < 2 ~ "£1-£2",
+      Price < 5 ~ "£2-£5",
+      Price < 10 ~ "£5-£10",
+      Price < 20 ~ "£10-£20",
+      TRUE ~ "Over £20"
+    )
+  ) |>
+  group_by(Price_Band) |>
+  summarise(
+    Product_Count = n_distinct(StockCode),
+    Total_Quantity_Sold = sum(Quantity, na.rm = TRUE),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Items_Per_Order = round(mean(Quantity), 1),
+    .groups = 'drop'
+  ) |>
+  mutate(
+    Revenue_Percent = round(Total_Revenue / sum(Total_Revenue) * 100, 1)
+  )
+
+print(price_point_analysis)
+
+
+# quantity discount opportunity
+quantity_analysis <- df |>
+  filter(!is.na(`Customer ID`), Revenue > 0) |>
+  group_by(Description, Quantity) |>
+  summarise(
+    Times_Ordered = n(),
+    Avg_Price = mean(Price, na.rm = TRUE),
+    .groups = 'drop'
+  ) |>
+  group_by(Description) |>
+  mutate(
+    Quantity_Orders = n()
+  ) |>
+  filter(Quantity_Orders >= 3) |>  # Products ordered in various quantities
+  arrange(Description, Quantity)
+
+# Fixed version of the quantity discount opportunity analysis
+
+# Products with high single-unit purchases (volume discount opportunity)
+# find products with many single-unit orders
+high_single_unit <- df |>
+  filter(!is.na(`Customer ID`), Revenue > 0, Quantity == 1) |>
+  group_by(Description) |>
+  summarise(
+    Single_Unit_Orders = n(),
+    Total_Revenue = sum(Revenue, na.rm = TRUE),
+    Avg_Price = round(mean(Price), 2),
+    .groups = 'drop'
+  ) |>
+  filter(Single_Unit_Orders >= 20) |>
+  arrange(desc(Single_Unit_Orders))
+
+print(head(high_single_unit, 25))
+
+
+# seasonal basket value patterns
+seasonal_basket <- basket_analysis |>
+  mutate(
+    Month = month(Invoice_Date, label = TRUE),
+    Season = case_when(
+      month(Invoice_Date) %in% c(2, 3) ~ "Feb-Mar",
+      month(Invoice_Date) %in% c(4, 5) ~ "Apr-May",
+      month(Invoice_Date) %in% c(8:12) ~ "Aug-Dec",
+      TRUE ~ "Other"
+    )
+  ) |>
+  group_by(Season) |>
+  summarise(
+    Avg_Basket_Value = round(mean(Basket_Value), 2),
+    Median_Basket_Value = round(median(Basket_Value), 2),
+    Avg_Items = round(mean(Items_in_Basket), 1),
+    Total_Baskets = n(),
+    .groups = 'drop'
+  )
+
+print(seasonal_basket)
+
+
+# high value basket analysis- What do big spenders buy?
+high_value_baskets <- basket_analysis |>
+  filter(Basket_Value >= quantile(Basket_Value, 0.90)) |>  # Top 10% baskets
+  inner_join(
+    df |> select(Invoice, Description, Revenue, Quantity),
+    by = "Invoice"
+  ) |>
+  group_by(Description) |>
+  summarise(
+    Appearances_in_High_Value_Baskets = n(),
+    Avg_Revenue_in_High_Baskets = round(mean(Revenue), 2),
+    .groups = 'drop'
+  ) |>
+  arrange(desc(Appearances_in_High_Value_Baskets))
+
+print(head(high_value_baskets, 20))
+```
+
+# Results
+
+Strategy 1: free shipping thresholds
+Current Situation:
+64.3% of baskets are below £150
+35.2% are between £250-£500
+
+Recommendation: Tiered Free Shipping
+Implementation:
+Standard Shipping: £7.95
+FREE shipping on orders:
+- £75+ (UK customers)
+- £150+ (International customers)
+- Always free for VIP tiers
+Logic:
+
+Currently 42.1% of baskets are below £100
+£75 threshold encourages customers to add just 1-2 more items
+Catches customers in the £50-£75 range (5.7% of baskets worth £1.6M)
+
+Strategy 2: Product Bundling
+Opportunity: 58.2% Single-Item Baskets
+Top Single-Item Products (Cross-Sell Targets):
+
+Regency Cakestand - 535 single-item purchases @ £52.73 avg
+White Hanging Heart T-Light Holder - 523 purchases @ £38.75
+Chilli Lights - 453 purchases @ £48.17
+Rabbit Night Light - 324 purchases @ £77.25
+
+Natural Product Pairs (Bought Together Frequently):
+
+Red + White Hanging Heart T-Light Holders (1,225 times)
+Wooden Frames (White + Antique) (1,014 times)
+Wicker Hearts (Large + Small) (914 times)
+Lunch Bags (multiple designs together) (700+ times each)
+
+Bundle Strategies:
+A. Pre-Made Bundles (5-10% discount):
+"T-Light Duo Bundle" 
+- Red + White Hanging Heart T-Light Holders
+- Individual: £5.98 each = £11.96
+- Bundle: £10.75 (10% off)
+- Upsell from single purchase (£5.98) to bundle (£10.75) = +80% basket value
+"Wicker Heart Set"
+- Large + Small Heart of Wicker
+- Individual: ~£50 combined
+- Bundle: £45 (10% off)
+"Kids Lunch Collection"
+- 3 lunch bags (mix designs: Spaceboy, Woodland, Cars)
+- Individual: £1.70 each = £5.10
+- Bundle: £4.50 (12% off for 3)
+B. Dynamic "Frequently Bought Together" Suggestions:
+
+When customer adds Regency Cakestand, suggest: "Add White Hanging Heart T-Light Holder for £38"
+When customer adds one lunch bag, suggest: "Complete the set - add 2 more for only £3"
+
+Strategy 3: Volume Discounts
+High Single-Unit Purchase Products:
+Products frequently bought in quantities of 1 (volume discount opportunity):
+
+Regency Cakestand - 900 single-unit orders
+Home/Love Building Block Words - 700+ single-unit orders each
+Recipe Box Pantry Design - 325 single-unit orders
+Kitchen Scales - 305 single-unit orders
+
+Tiered Volume Pricing:
+"Buy More, Save More" Pricing:
+
+Example: Home Building Block Word (£6.03 each)
+- Buy 1: £6.03
+- Buy 2: £11.50 (5% off = £5.75 each)
+- Buy 3+: £16.50 (9% off = £5.50 each)
+
+Message: "Create your custom phrase! Buy 3 words, save 9%"
+
+Strategy 4: Tiered Pricing by Customer Segment
+Cluster 1
+avg basket- 554.47
+avg items- 21.2
+median basket- 422.12
+
+Cluster 2
+avg basket- 255.11
+avg items- 17.7
+median basket- 194.60
+
+Cluster 3
+avg basket- 224.74
+avg items- 21.0
+median basket- 258.46
+
+Segment-Specific Strategies:
+Cluster 1 (Wholesale) - Already High Baskets:
+
+Strategy: Encourage even larger orders with progressive discounts
+"Spend £1,000, get 5% off entire order"
+"Orders over £2,000 qualify for Net 30 terms"
+Target: Increase avg basket from £554 to £650
+
+Cluster 2 (Casual) - Lowest Baskets:
+
+Strategy: Use free shipping threshold to boost
+"Add £20 more for free shipping!"
+Target: Increase avg basket from £255 to £300
+
+Cluster 3 (High-Value) - Good Potential:
+
+Strategy: Product recommendations and bundles
+"Customers who bought this also added..."
+"Complete your collection with these 3 items"
+Target: Increase avg basket from £335 to £400
+
+Strategy 5: Price Point Optimization
+Current Price Band Performance:
+Price band 1-2 is 29.4% of revenue  1,984 products
+Price band 2-5 is 36.9% of revenue, 2,221 products
+Price band 5-10 is 14.1% of revenue, 939 products
+
+1-5 drive 66.3% of revenue
+
+Strategy: Add-On Item Pricing
+Create "Impulse Add-On" Category:
+
+Products under £3 positioned as "Add to your order"
+"Top up your basket with these under £3"
+Strategic placement at checkout
+
+Examples of high-volume low-price items:
+
+Home/Love Building Block Words (£6.03) - Bundle 3 for £16.50
+T-Light Holders (£2.99) - "Add 2 more for £5.50"
+Fairy Cake Cases (£1-£2) - "Add 3 packs for £5"
+
